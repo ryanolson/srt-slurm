@@ -3,13 +3,16 @@
 
 """Tests for dry-run config details display (mounts, env vars)."""
 
+import json
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import yaml
 
+from srtctl.backends.vllm import KvbmHubConfig, VLLMProtocol, VLLMServerConfig
 from srtctl.cli.submit import show_config_details
 from srtctl.core.schema import SrtConfig
 
@@ -313,6 +316,114 @@ class TestDryRunExecutionExtensions:
         output = capsys.readouterr().out
         assert "<job container>" in output
         assert "MOONCAKE_PROTOCOL" in output
+
+
+class TestDryRunKvbmHub:
+    """KVBM hub config surfaces in dry-run and renders the decode connector."""
+
+    def test_kvbm_hub_details_shown(self, capsys):
+        """kvbm_hub should appear in the execution-extensions panel."""
+        config = _make_config(
+            {
+                "backend": {
+                    "type": "vllm",
+                    "kvbm_hub": {
+                        "block_layout": "universal",
+                        "min_remote_prefill_tokens": 256,
+                        "host_cache_gb": 400.0,
+                    },
+                    "vllm_config": {"aggregated": {"block-size": 64, "max-model-len": 40960}},
+                }
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "kvbm_hub" in output
+        assert "discovery_port" in output
+        assert "min_remote_prefill_tokens" in output
+        assert "universal" in output
+        assert "indexer,p2p,disagg" in output
+
+    def test_kvbm_hub_connector_built(self):
+        """The static decode connector matches the validated kvbm v2 config; a
+        prefill is a pure CD target (remote_search explicitly OFF, no threshold)."""
+        backend = VLLMProtocol(
+            kvbm_hub=KvbmHubConfig(block_layout="universal", min_remote_prefill_tokens=256, host_cache_gb=400.0),
+            vllm_config=VLLMServerConfig(aggregated={"block-size": 64, "max-model-len": 40960}),
+        )
+        assert backend.kvbm_block_size() == 64
+        assert backend.kvbm_max_seq_len() == 40960
+
+        cfg = json.loads(backend.build_kvbm_hub_connector("decode", "http://infra0:1337"))
+        assert cfg["kv_connector"] == "DynamoConnector"
+        assert cfg["kv_connector_module_path"] == "kvbm.v2.vllm.connector"
+        leader = cfg["kv_connector_extra_config"]["leader"]
+        assert leader["hub"]["url"] == "http://infra0:1337"
+        assert leader["hub"]["features"] == ["indexer", "p2p", "disagg"]
+        assert leader["disagg"] == {"role": "decode", "min_remote_prefill_tokens": 256}
+        assert leader["remote_search"] == {"enabled": True}
+        assert cfg["kv_connector_extra_config"]["default"]["block_layout"] == "universal"
+        assert leader["max_seq_len"] == 40960
+
+        prefill = json.loads(backend.build_kvbm_hub_connector("prefill", "http://infra0:1337"))
+        pleader = prefill["kv_connector_extra_config"]["leader"]
+        assert pleader["disagg"] == {"role": "prefill"}
+        # prefill carries NO threshold (decode-only) and remote_search EXPLICITLY off
+        # (provable in the static config; default decode=on / prefill=off).
+        assert "min_remote_prefill_tokens" not in pleader["disagg"]
+        assert pleader["remote_search"] == {"enabled": False}
+
+    def test_kvbm_prefill_aside_reserves_extra_nodes(self):
+        """kvbm_prefill_nodes folds into total_nodes (on top of the decode plane)
+        without flipping the deployment into dynamo-disaggregated mode."""
+        config = _make_config(
+            {
+                "resources": {
+                    "gpu_type": "h100",
+                    "gpus_per_node": 8,
+                    "agg_nodes": 1,
+                    "agg_workers": 2,
+                    "kvbm_prefill_nodes": 1,
+                    "kvbm_prefill_tp": 2,
+                    # Clear the disagg defaults from BASE_CONFIG so this is an agg deployment.
+                    "prefill_nodes": None,
+                    "decode_nodes": None,
+                    "prefill_workers": None,
+                    "decode_workers": None,
+                },
+                "backend": {"type": "vllm", "kvbm_hub": {}},
+            }
+        )
+        assert config.resources.is_disaggregated is False
+        assert config.resources.total_nodes == 1 + 1  # agg_nodes + kvbm_prefill_nodes
+
+    def test_kvbm_prefill_command_built(self):
+        """The prefill aside launches kvbm.vllm.prefill (NOT dynamo.vllm) with the
+        role=prefill connector and the requested TP/EP."""
+        backend = VLLMProtocol(
+            kvbm_hub=KvbmHubConfig(),
+            vllm_config=VLLMServerConfig(
+                aggregated={"block-size": 64, "max-model-len": 40960, "enable-expert-parallel": True}
+            ),
+        )
+        runtime = SimpleNamespace(model_path=Path("Qwen/Qwen3-235B-A22B-NVFP4"), is_hf_model=True)
+        cmd = backend.build_kvbm_prefill_command(runtime, tp=4, hub_url="http://infra0:1337")
+        assert cmd[:3] == ["python3", "-m", "kvbm.vllm.prefill"]
+        assert "--tensor-parallel-size" in cmd and cmd[cmd.index("--tensor-parallel-size") + 1] == "4"
+        assert "--enable-expert-parallel" in cmd
+        kv = json.loads(cmd[cmd.index("--kv-transfer-config") + 1])
+        assert kv["kv_connector_extra_config"]["leader"]["disagg"]["role"] == "prefill"
+
+    def test_kvbm_recipe_file_wires_local_wheel_install(self):
+        """The shipped recipe installs dynamo+kvbm from LOCAL wheels (setup_script)
+        and disables srt-slurm's PyPI installer (dynamo.install=false), so the dev
+        kvbm image (no `dynamo` pkg) is provisioned without pulling ai-dynamo 0.8.0."""
+        recipe = Path(__file__).resolve().parents[1] / "recipes/vllm/kvbm/agg-kv-router-hub.yaml"
+        config = SrtConfig.from_yaml(recipe)
+        assert config.setup_script == "kvbm-dev-install.sh"
+        assert config.dynamo.install is False
+        # the setup_script must actually exist where it'll be staged (/configs)
+        assert (Path(__file__).resolve().parents[1] / "configs" / config.setup_script).is_file()
 
 
 class TestDryRunHetJobs:

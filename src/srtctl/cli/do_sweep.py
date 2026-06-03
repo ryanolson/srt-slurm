@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from srtctl.backends.sglang import SGLangProtocol
+from srtctl.backends.vllm import VLLMProtocol
 from srtctl.cli.mixins import (
     BenchmarkStageMixin,
     FrontendStageMixin,
@@ -49,6 +50,9 @@ from srtctl.logging_utils import setup_logging
 from srtctl.ports import (
     ETCD_CLIENT_PORT,
     FRONTEND_PUBLIC_PORT,
+    KVBM_HUB_CONTROL_PORT,
+    KVBM_HUB_DISCOVERY_PORT,
+    KVBM_HUB_VELO_PORT,
     MOONCAKE_HTTP_METADATA_PORT,
     MOONCAKE_MASTER_PORT,
     NATS_PORT,
@@ -257,6 +261,165 @@ class SweepOrchestrator(
         logger.info("mooncake_master is ready")
 
         return managed
+
+    def start_kvbm_hub(self, registry: ProcessRegistry) -> ManagedProcess | None:
+        """Launch kvbm_hub on the infra node if the vLLM backend sets kvbm_hub.
+
+        Mirrors start_mooncake_master: the coordination service runs on the same
+        node as etcd/nats. The hub owns conditional-disagg prefill dispatch
+        (``--prefill-router``) and remote-search discovery (the ``indexer``
+        feature). Decode workers register the kvbm v2 connector against
+        ``http://<infra>:1337`` (built by VLLMProtocol.build_kvbm_hub_connector);
+        block_size / max_seq_len / layout MUST match the workers' (the hub's
+        must-match register check), so they come from the same backend config.
+        """
+        backend = self.config.backend
+        if not isinstance(backend, VLLMProtocol):
+            return None
+        hub_cfg = backend.kvbm_hub
+        if hub_cfg is None:
+            return None
+
+        infra_node = self.runtime.nodes.infra
+        container = hub_cfg.container or str(self.runtime.container_image)
+        hub_log = self.runtime.log_dir / "kvbm_hub.out"
+
+        # KvbmConfig overrides (one --kvbm KEY.PATH=VALUE per entry), mirroring the
+        # validated harness run-hub.sh "dynamo" arm.
+        kvbm_overrides = [
+            "leader.tokio.worker_threads=2",
+            "worker.tokio.worker_threads=2",
+            "leader.control.metrics=true",
+            "leader.control.dev=true",
+            f"leader.onboard.mode={hub_cfg.onboard_mode}",
+            "worker.nixl.backends.UCX={}",
+            "worker.nixl.backends.POSIX={}",
+        ]
+        if hub_cfg.remote_search:
+            kvbm_overrides.append("leader.remote_search.enabled=true")
+
+        command = [
+            hub_cfg.hub_binary,
+            "--discovery-port", str(KVBM_HUB_DISCOVERY_PORT),
+            "--control-port", str(KVBM_HUB_CONTROL_PORT),
+            "--velo-port", str(KVBM_HUB_VELO_PORT),
+            "--heartbeat-interval-secs", "10",
+            "--block-size", str(backend.kvbm_block_size()),
+            "--max-seq-len", str(backend.kvbm_max_seq_len()),
+            "--layout", hub_cfg.block_layout,
+            "--kv-index-advertise-host", infra_node,
+            "--features", hub_cfg.features,
+            "--g2-memory", str(int(hub_cfg.host_cache_gb)),
+            "--prefill-router",
+            "--prefill-worker-concurrency", "4",
+        ]
+        for kv in kvbm_overrides:
+            command += ["--kvbm", kv]
+
+        logger.info(
+            "Starting kvbm_hub on %s (discovery=%d, control=%d, velo=%d, features=%s, layout=%s)",
+            infra_node,
+            KVBM_HUB_DISCOVERY_PORT,
+            KVBM_HUB_CONTROL_PORT,
+            KVBM_HUB_VELO_PORT,
+            hub_cfg.features,
+            hub_cfg.block_layout,
+        )
+
+        proc = start_srun_process(
+            command=command,
+            nodelist=[infra_node],
+            output=str(hub_log),
+            container_image=container,
+            container_mounts=self.runtime.container_mounts,
+            env_to_set=dict(hub_cfg.env) if hub_cfg.env else None,
+            het_group=self.runtime.nodes.het_group_for(infra_node),
+        )
+
+        managed = ManagedProcess(
+            name="kvbm_hub",
+            popen=proc,
+            log_file=hub_log,
+            node=infra_node,
+            critical=True,
+        )
+
+        logger.info("Waiting for kvbm_hub control (port %d) on %s...", KVBM_HUB_CONTROL_PORT, infra_node)
+        if not wait_for_port(infra_node, KVBM_HUB_CONTROL_PORT, timeout=180):
+            raise RuntimeError("kvbm_hub failed to start")
+        logger.info("kvbm_hub is ready")
+
+        return managed
+
+    def start_kvbm_prefill_workers(self, registry: ProcessRegistry) -> list[ManagedProcess]:
+        """Launch the hub-owned PREFILL ASIDE (python -m kvbm.vllm.prefill) on
+        nodes reserved by resources.kvbm_prefill_nodes — OUTSIDE the dynamo
+        endpoint topology. These workers join the kvbm_hub prefill-router velo
+        fleet and never register to dynamo/etcd, so the frontend/router ignore them.
+
+        Phase-2 scope: one worker per node at kvbm_prefill_tp == gpus_per_node
+        (multi-node TP / intra-node GPU packing is a follow-up).
+        """
+        backend = self.config.backend
+        if not isinstance(backend, VLLMProtocol) or backend.kvbm_hub is None:
+            return []
+        n_prefill = self.config.resources.kvbm_prefill_nodes or 0
+        if n_prefill <= 0:
+            return []
+
+        # Carve the worker nodes the dynamo (agg/decode) endpoints did NOT take.
+        used: set[str] = set()
+        for ep in self.endpoints:
+            used.update(ep.nodes)
+        free = [n for n in self.runtime.nodes.worker if n not in used and n != self.runtime.nodes.infra]
+        if len(free) < n_prefill:
+            raise RuntimeError(
+                f"kvbm_prefill needs {n_prefill} free node(s) but only {len(free)} are unused by the "
+                f"dynamo plane ({free}). Ensure resources.kvbm_prefill_nodes is added on top of the "
+                f"agg/decode node count (it folds into total_nodes)."
+            )
+        prefill_nodes = free[:n_prefill]
+
+        tp = self.config.resources.kvbm_prefill_tp or self.runtime.gpus_per_node
+        hub_url = f"http://{self.runtime.nodes.infra}:{KVBM_HUB_DISCOVERY_PORT}"
+        # The prefill aside runs `python -m kvbm.vllm.prefill`, so it needs the kvbm
+        # wheel in the venv. It bypasses the standard worker stage, so apply the SAME
+        # preamble (setup_script wheel install) the decode workers + frontend get.
+        preamble = self._build_worker_preamble()
+        managed_list: list[ManagedProcess] = []
+        for i, node in enumerate(prefill_nodes):
+            log = self.runtime.log_dir / f"{node}_kvbm_prefill_w{i}.out"
+            cmd = backend.build_kvbm_prefill_command(self.runtime, tp, hub_url)
+            # The aside bypasses the standard worker env path, so seed it with the
+            # global recipe environment (HF_HOME etc.), then HF offline, then any
+            # kvbm_hub.env overrides.
+            env_to_set: dict[str, str] = {}
+            if getattr(self.config, "environment", None):
+                env_to_set.update(self.config.environment)
+            env_to_set["HF_HUB_OFFLINE"] = "1"
+            if backend.kvbm_hub.env:
+                env_to_set.update(backend.kvbm_hub.env)
+            logger.info("Starting kvbm_prefill worker %d on %s (tp=%d, hub=%s)", i, node, tp, hub_url)
+            proc = start_srun_process(
+                command=cmd,
+                nodelist=[node],
+                output=str(log),
+                container_image=str(self.runtime.container_image),
+                container_mounts=self.runtime.container_mounts,
+                env_to_set=env_to_set,
+                bash_preamble=preamble,
+                het_group=self.runtime.nodes.het_group_for(node),
+            )
+            managed = ManagedProcess(
+                name=f"kvbm_prefill_{i}_{node}",
+                popen=proc,
+                log_file=log,
+                node=node,
+                critical=True,
+            )
+            registry.add_process(managed)
+            managed_list.append(managed)
+        return managed_list
 
     def _print_connection_info(self) -> None:
         """Print srun commands for connecting to nodes."""
@@ -612,6 +775,13 @@ class SweepOrchestrator(
             if mooncake_proc is not None:
                 registry.add_process(mooncake_proc)
 
+            # Stage 1c: KVBM hub (optional, co-located with infra node). Owns
+            # conditional-disagg prefill dispatch + remote-search discovery; decode
+            # workers register the kvbm v2 connector against it.
+            kvbm_hub_proc = self.start_kvbm_hub(registry)
+            if kvbm_hub_proc is not None:
+                registry.add_process(kvbm_hub_proc)
+
             # Pre-worker: Ensure HF model is cached before starting workers.
             # 1. Clean stale lock files from previous crashed downloads
             # 2. Download model on a single node (blocks until complete)
@@ -624,6 +794,10 @@ class SweepOrchestrator(
             reporter.report(JobStatus.WORKERS, JobStage.WORKERS, "Starting workers")
             worker_procs = self.start_all_workers()
             registry.add_processes(worker_procs)
+
+            # Stage 2b: KVBM prefill aside (hub-owned, dynamo-invisible). Carves
+            # the worker nodes the dynamo endpoints did not take.
+            self.start_kvbm_prefill_workers(registry)
 
             # Stage 3: Frontend
             reporter.report(JobStatus.FRONTEND, JobStage.FRONTEND, "Starting frontend")

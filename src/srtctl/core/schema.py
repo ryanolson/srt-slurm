@@ -492,6 +492,17 @@ class ResourceConfig:
     agg_nodes: int | None = None
     agg_workers: int | None = None
 
+    # KVBM prefill ASIDE: extra GPU nodes reserved for hub-owned prefill workers
+    # (python -m kvbm.vllm.prefill, one worker per node), OUTSIDE the dynamo
+    # endpoint topology — they register only to the kvbm_hub, never to dynamo/etcd,
+    # so the frontend/router neither waits on nor routes to them. Folded into
+    # total_nodes (so Slurm allocates them) but NOT into is_disaggregated.
+    # See backend.kvbm_hub + do_sweep.start_kvbm_prefill_workers. (Phase-2 scope:
+    # one worker per node at kvbm_prefill_tp == gpus_per_node; multi-node TP / GPU
+    # packing within a node is a follow-up.)
+    kvbm_prefill_nodes: int | None = None
+    kvbm_prefill_tp: int | None = None  # TP per prefill worker (default: gpus_per_node)
+
     # If True, place each partial-node worker on its own node instead of
     # packing multiple onto the same node. Caller must reserve enough nodes
     # (e.g. set decode_nodes=decode_workers when gpus_per_decode<gpus_per_node).
@@ -543,9 +554,9 @@ class ResourceConfig:
 
     @property
     def total_nodes(self) -> int:
-        if self.is_disaggregated:
-            return (self.prefill_nodes or 0) + (self.decode_nodes or 0)
-        return self.agg_nodes or 1
+        base = (self.prefill_nodes or 0) + (self.decode_nodes or 0) if self.is_disaggregated else (self.agg_nodes or 1)
+        # The kvbm prefill aside reserves its own GPU nodes on top of the dynamo plane.
+        return base + (self.kvbm_prefill_nodes or 0)
 
     @property
     def num_prefill(self) -> int:

@@ -58,7 +58,7 @@ from srtctl.core.lockfile import load_lockfile_fingerprints
 from srtctl.core.schema import SrtConfig
 from srtctl.core.status import create_job_record
 from srtctl.core.validation import preflight_config_variants
-from srtctl.ports import MOONCAKE_MASTER_PORT
+from srtctl.ports import KVBM_HUB_DISCOVERY_PORT, MOONCAKE_MASTER_PORT
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -305,11 +305,13 @@ def show_config_details(config: SrtConfig) -> None:
         opts = " ".join(f"--{k}={v}" if v else f"--{k}" for k, v in config.srun_options.items())
         console.print(f"[dim]srun options:[/] {opts}")
 
+    kvbm_hub_cfg = getattr(backend, "kvbm_hub", None)
     show_extensions = (
         config.benchmark.type == "custom"
         or config.benchmark.container_image
         or config.telemetry.enabled
         or mooncake_cfg is not None
+        or kvbm_hub_cfg is not None
     )
     if show_extensions:
         details = Table(title="Execution Extensions", show_lines=False, pad_edge=False)
@@ -338,6 +340,13 @@ def show_config_details(config: SrtConfig) -> None:
         if mooncake_cfg is not None:
             details.add_row("mooncake", "container", mooncake_cfg.container or "<job container>")
             details.add_row("mooncake", "master_port", f"{MOONCAKE_MASTER_PORT} (auto)")
+
+        if kvbm_hub_cfg is not None:
+            details.add_row("kvbm_hub", "container", kvbm_hub_cfg.container or "<job container>")
+            details.add_row("kvbm_hub", "discovery_port", f"{KVBM_HUB_DISCOVERY_PORT} (auto)")
+            details.add_row("kvbm_hub", "features", kvbm_hub_cfg.features)
+            details.add_row("kvbm_hub", "block_layout", kvbm_hub_cfg.block_layout)
+            details.add_row("kvbm_hub", "min_remote_prefill_tokens", str(kvbm_hub_cfg.min_remote_prefill_tokens))
 
         console.print(Panel(details, border_style="blue"))
 

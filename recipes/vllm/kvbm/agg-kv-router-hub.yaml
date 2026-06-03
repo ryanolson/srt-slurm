@@ -1,0 +1,156 @@
+# KVBM full-dynamo plane: dynamo frontend + KV-router -> AGGREGATED decode workers
+# running the kvbm v2 connector (role=decode) against a kvbm_hub on the infra node,
+# PLUS a hub-owned PREFILL ASIDE (kvbm.vllm.prefill on reserved nodes). The hub owns
+# conditional-disagg prefill dispatch (--prefill-router) + remote-search discovery
+# (indexer); the in-process consolidator relays each decode worker's KV events to the
+# router. The prefill aside registers ONLY to the hub (dynamo/etcd never see it).
+#
+# Decode is AGGREGATED on purpose: `--disaggregation-mode decode` disables the
+# KV-event publisher, which blinds the router.
+#
+# Validated equivalent (hand-rolled harness): /lustre/fsw/core_dlfw_ci/ryan/stage2b_results.md
+# Flip to 235B-A22B-NVFP4 TEP=4 by swapping model + tensor-parallel-size: 4 +
+# enable-expert-parallel: true (see commented block).
+
+name: "kvbm-vllm-agg-kv-hub"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  time_limit: "01:15:00"
+
+# Install the locally-built kvbm + ai_dynamo + ai_dynamo_runtime wheels into the
+# image venv before frontend/decode/prefill start (the dev kvbm image lacks the
+# `dynamo` package + kvbm). Runs IN-container, once per node, from the mounted
+# dynamo repo (target/wheels). PRODUCTION image (baked) => the script verify-no-ops.
+setup_script: kvbm-dev-install.sh
+dynamo:
+  # We install dynamo from the LOCAL wheels (setup_script), not PyPI. Leaving this
+  # default (true) would make srt-slurm also `pip install ai-dynamo==0.8.0` from
+  # pypi.nvidia.com — wrong version, and it would clobber our wheels.
+  install: false
+
+model:
+  # hf: prefix => resolved from the HF cache (offline), NOT a local mount. Matches
+  # the validated harness model. (A bare path would be treated as a local dir.)
+  path: "hf:Qwen/Qwen3-32B"
+  # The kvbm dev image (.sqsh). DEV variant: setup_script installs the wheels; the
+  # hub binary runs from /workspace/target/release (mounted below). For a PRODUCTION
+  # image, point this at kvbm-prod-<date>.sqsh (setup_script verify-no-ops).
+  container: "/lustre/fsw/core_dlfw_ci/ryan/kvbm.sqsh"
+  precision: "bf16"                  # Qwen3-32B native (235B-NVFP4 override: fp4)
+
+# Mount the dynamo repo (wheels for setup_script + the kvbm_hub/kvbmctl binaries +
+# start-hub.sh) at /workspace, and the project root at /models so the HF cache is
+# /models/hf_cache. List form (not a dict) avoids the show_config_details FormattablePath
+# display bug.
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan:/models"
+
+# Offline HF cache for every component (frontend resolves the tokenizer; decode +
+# prefill load weights). The prefill aside + decode + frontend all read these.
+environment:
+  HF_HOME: "/models/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  # kvbm v2 connector rejects vllm > 0.19.999 unless bypassed (image ships 0.21.0).
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  # NIXL UCX: configuring cache.host auto-enables NIXL/UCX. The image's default
+  # NIXL_PLUGIN_DIR (/opt/dynamo/nixl/plugins, system NIXL) MISMATCHES the libnixl
+  # the connector actually loads (the cu13 WHEEL's, via $ORIGIN RPATH) => "backend
+  # 'UCX' not found". Pin it to the wheel's plugins (probed via /proc/maps on the
+  # 260602 image; ldd-clean). Image-specific — re-probe if the image changes.
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  # CD observability metrics (Prometheus) — the durable, always-on channel for the
+  # local-vs-remote prefill decision counts, local/remote token sums + the remote
+  # distribution, and the decode<->prefill reconciliation. Lives in the
+  # kvbm-observability registry; independent of the DYN_LOG level below. Scrape
+  # http://<worker>:6880/metrics (or curl it once at benchmark end — counters are
+  # cumulative; histograms carry the distribution).
+  DYN_KVBM_METRICS: "1"
+  # NOTE: start_metrics_server binds a FIXED port per process. With >1 agg worker
+  # per node the 2nd worker's bind fails (NON-FATAL warn, no /metrics on it). For
+  # full per-worker coverage run 1 worker/node OR add a per-worker
+  # DYN_KVBM_METRICS_PORT offset in srtctl (follow-up).
+  DYN_KVBM_METRICS_PORT: "6880"
+  # Logging: default ERROR, set on BOTH knobs together — DYN_LOG (dynamo frontend)
+  # and RUST_LOG (kvbm connector/engine + kvbm_hub). The CD execution path still
+  # emits per-request tracing::info! (decode_gnmt ~13, coordinator ~16) on top of
+  # the kvbm_audit flood, so base-info floods long runs (~600MB decode logs). The CD
+  # metrics above are the durable, log-level-independent observability signal.
+  # NOTE error also suppresses WARN (OSL-mismatch, budget, USAA desync); raise to
+  # "warn" to keep those, or "info"/"debug" to debug a bringup. (Future: demote the
+  # per-request info to debug + a concise request-level info macro -> info is clean.)
+  DYN_LOG: "error"
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4                   # ptyche GB200: 4 GPUs + 2 NUMA per node
+  # Decode plane = AGGREGATED workers (>=2 so the router can make a cache-aware
+  # choice). 2 TP2 workers = 4 GPUs = one GB200 node.
+  agg_nodes: 1
+  agg_workers: 2
+  gpus_per_agg: 2
+  # Hub-owned PREFILL ASIDE: extra GPU node(s) for kvbm.vllm.prefill, reserved on
+  # top of the decode plane (folds into total_nodes; dynamo-invisible). One worker
+  # per node at kvbm_prefill_tp (default gpus_per_node).
+  kvbm_prefill_nodes: 1
+  kvbm_prefill_tp: 2
+
+infra:
+  # Dedicate a node for etcd/nats + the kvbm_hub aux-service.
+  etcd_nats_dedicated_node: true
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: "kv"
+    router-kv-events: true
+    router-min-initial-workers: 2   # = agg_workers (decode only; prefill is invisible)
+
+backend:
+  type: vllm
+
+  # KVBM hub (conditional-disagg + remote-search). Launches kvbm_hub on the infra
+  # node and makes the agg/decode workers register the kvbm v2 connector against
+  # it (prefix-caching + KV events are forced ON by the backend for this path).
+  kvbm_hub:
+    block_layout: operational          # "universal" for asymmetric TP vs the prefill aside
+    min_remote_prefill_tokens: 256     # ThresholdRemote: <256 prefill locally, >=256 disaggregate
+    host_cache_gb: 100.0
+    # hub_binary: /workspace/target/release/kvbm_hub   # default; override if elsewhere
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+    # (kvbm/vllm/NIXL env is in the global `environment` block, which worker_stage
+    # merges into every worker — decode included — and the prefill stage merges too.)
+
+  vllm_config:
+    aggregated:
+      served-model-name: "Qwen/Qwen3-32B"
+      tensor-parallel-size: 2
+      gpu-memory-utilization: 0.85
+      block-size: 64                   # MUST match the hub --block-size (read from here)
+      max-model-len: 40960             # MUST match the hub --max-seq-len (read from here)
+      # (no disable-log-requests: vllm 0.21.0 renamed it to --no-enable-log-requests;
+      #  the validated harness never disabled request logging — leave default.)
+      # enable-prefix-caching is forced ON by the kvbm_hub path (do not set
+      # no-enable-prefix-caching here — it is stripped).
+
+# --- 235B-A22B-NVFP4 TEP=4 override (the real target) ------------------------
+# model:
+#   path: "qwen3-235b-a22b-nvfp4"
+#   container: "<our kvbm image>"
+# resources: { gpu_type: gb200, gpus_per_node: 4, agg_nodes: 2, agg_workers: 2, gpus_per_agg: 4 }
+# backend.kvbm_hub.host_cache_gb: 400.0
+# vllm_config.aggregated: { tensor-parallel-size: 4, enable-expert-parallel: true }
+
+benchmark:
+  type: "mooncake-router"
+  mooncake_workload: "conversation"
+  ttft_threshold_ms: 2000
+  itl_threshold_ms: 25

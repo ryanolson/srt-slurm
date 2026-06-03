@@ -34,3 +34,10 @@ VLLM_DATA_PARALLEL_RPC_PORT = 8400
 # Dynamo runtime and connector ports.
 DYN_SYSTEM_PORT_BASE = 7500
 KVBM_ZMQ_PORT_BASE = 5600
+
+# KVBM hub (the conditional-disagg + remote-search coordination service that
+# decode/prefill workers register to). Launched as an aux-service on the infra
+# node (see do_sweep.start_kvbm_hub), mirroring mooncake_master.
+KVBM_HUB_DISCOVERY_PORT = 1337  # GET /v1/config + worker discovery
+KVBM_HUB_CONTROL_PORT = 8337  # /health + control plane
+KVBM_HUB_VELO_PORT = 1338  # Velo transport (CD prefill <-> decode pull)

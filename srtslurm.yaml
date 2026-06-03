@@ -1,0 +1,17 @@
+# srtslurm.yaml — ptyche (NVIDIA ASE pre-cluster: Slurm + Pyxis/enroot, GB200-NVL36x2,
+# aarch64/Grace, 4 GPUs + 2 NUMA per node). Cluster-wide defaults for srtctl.
+# Discovered via the cwd search order (run srtctl from the repo root) or SRTSLURM_CONFIG.
+cluster: ptyche
+default_account: core_dlfw_ci
+default_partition: tcpo          # idle GB200 nodes, schedules in seconds (5h limit)
+gpus_per_node: 4
+
+# ptyche has NO GPU gres — `--gpus-per-node` errors ("Invalid generic resource").
+# Nodes are whole-node/exclusive, so DON'T emit the directive. DO emit `--segment`
+# (force N nodes into one NVLink block for NVL alignment).
+use_gpus_per_node_directive: false
+use_segment_sbatch_directive: true
+use_exclusive_sbatch_directive: false
+
+# Where /configs (NATS/etcd binaries, setup scripts) is mounted from.
+srtctl_root: /lustre/fsw/core_dlfw_ci/ryan/srt-slurm

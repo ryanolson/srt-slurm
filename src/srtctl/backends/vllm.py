@@ -24,7 +24,13 @@ from typing import (
 from marshmallow import Schema
 from marshmallow_dataclass import dataclass
 
-from srtctl.ports import DYN_SYSTEM_PORT_BASE, VLLM_DATA_PARALLEL_RPC_PORT
+from srtctl.ports import (
+    DYN_SYSTEM_PORT_BASE,
+    KV_EVENTS_PORT_BASE,
+    KVBM_HUB_DISCOVERY_PORT,
+    KVBM_ZMQ_PORT_BASE,
+    VLLM_DATA_PARALLEL_RPC_PORT,
+)
 
 if TYPE_CHECKING:
     from srtctl.backends.base import SrunConfig
@@ -47,6 +53,49 @@ class VLLMServerConfig:
     prefill: dict[str, Any] | None = None
     decode: dict[str, Any] | None = None
     aggregated: dict[str, Any] | None = None
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
+class KvbmHubConfig:
+    """KVBM hub (conditional-disagg + remote-search) configuration.
+
+    When present on a vLLM backend, srtslurm:
+    1. Launches ``kvbm_hub`` on the infra node (do_sweep.start_kvbm_hub) with the
+       indexer+p2p+disagg feature set and the prefill-router enabled.
+    2. Injects ``KVBM_HUB_URL=http://<infra>:1337`` on every worker.
+    3. Builds the decode (agg) workers' ``--kv-transfer-config`` to register the
+       kvbm v2 connector (role=decode) against that hub, with prefix-caching + KV
+       events ON so the in-process consolidator relays to the dynamo KV-router.
+
+    Decode MUST run in AGGREGATED mode (``--disaggregation-mode decode`` disables
+    the KV-event publisher → the router goes blind). The hub's block_size /
+    max_seq_len / block_layout must match the workers'; block_size and max_seq_len
+    are read from the decode/aggregated vllm_config (``--block-size`` /
+    ``--max-model-len``) to avoid drift, block_layout is set here (use ``universal``
+    for asymmetric TP between decode and the prefill aside).
+
+    Example YAML:
+        backend:
+          type: vllm
+          kvbm_hub:
+            block_layout: operational        # ``universal`` for asymmetric TP
+            min_remote_prefill_tokens: 256    # ThresholdRemote: <N local, >=N disagg
+            host_cache_gb: 100.0
+    """
+
+    container: str | None = None
+    hub_binary: str = "/workspace/target/release/kvbm_hub"
+    features: str = "indexer,p2p,disagg"
+    block_layout: str = "operational"
+    min_remote_prefill_tokens: int = 256
+    host_cache_gb: float = 100.0
+    remote_search: bool = True          # decode: remote-search ON by default
+    remote_search_prefill: bool = False  # prefill: OFF by default (pure CD target; no indexer)
+    onboard_mode: str = "inter"
+    connector_module_path: str = "kvbm.v2.vllm.connector"
+    env: dict[str, str] = field(default_factory=dict)
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -93,6 +142,12 @@ class VLLMProtocol:
     # Can be overridden per mode by setting "connector" in vllm_config.prefill/decode/aggregated.
     # dynamo 1.0.0+: translated to --kv-transfer-config (--connector was removed).
     connector: str | None = "nixl"
+
+    # KVBM hub (conditional-disagg + remote-search). When set, the decode workers
+    # register the kvbm v2 connector against the hub launched on the infra node,
+    # and their --kv-transfer-config is built from this config (overriding
+    # ``connector`` for agg/decode workers). See KvbmHubConfig.
+    kvbm_hub: KvbmHubConfig | None = None
 
     # Allow prefill and decode workers to share one node when the combined GPU
     # request fits within gpus_per_node. Defaults off to preserve existing P/D
@@ -146,6 +201,17 @@ class VLLMProtocol:
             env["DYN_VLLM_KV_EVENT_PORT"] = str(process.kv_events_port)
         if process.nixl_port is not None:
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(process.nixl_port)
+        # Deterministic per-worker KVBM leader ZMQ ports so co-located decode
+        # workers don't collide on the default 56001 (the in-process consolidator
+        # derives its egress port from DYN_KVBM_LEADER_ZMQ_PUB_PORT). This mirrors
+        # worker_stage._apply_kvbm_endpoint_env, which only fires for the
+        # DYN_CONNECTOR=kvbm path — our connector arrives via --kv-transfer-config.
+        if self.kvbm_hub is not None and process.kv_events_port is not None:
+            port_offset = max(0, process.kv_events_port - KV_EVENTS_PORT_BASE)
+            pub_port = KVBM_ZMQ_PORT_BASE + (port_offset * 2)
+            if pub_port + 1 <= 65535:
+                env["DYN_KVBM_LEADER_ZMQ_PUB_PORT"] = str(pub_port)
+                env["DYN_KVBM_LEADER_ZMQ_ACK_PORT"] = str(pub_port + 1)
         return env
 
     def get_served_model_name(self, default: str) -> str:
@@ -157,6 +223,106 @@ class VLLMProtocol:
                     if name:
                         return name
         return default
+
+    # =========================================================================
+    # KVBM hub (conditional-disagg + remote-search) helpers
+    # =========================================================================
+
+    def _vllm_cfg_value(self, *keys: str, default: Any = None) -> Any:
+        """First matching value across aggregated/decode/prefill vllm_config dicts."""
+        if not self.vllm_config:
+            return default
+        for cfg in (self.vllm_config.aggregated, self.vllm_config.decode, self.vllm_config.prefill):
+            if not cfg:
+                continue
+            for key in keys:
+                if cfg.get(key) is not None:
+                    return cfg[key]
+        return default
+
+    def kvbm_block_size(self) -> int:
+        return int(self._vllm_cfg_value("block-size", "block_size", default=64))
+
+    def kvbm_max_seq_len(self) -> int:
+        return int(self._vllm_cfg_value("max-model-len", "max_model_len", default=40960))
+
+    def build_kvbm_hub_connector(self, role: str, hub_url: str) -> str:
+        """Build the STATIC kvbm v2 connector --kv-transfer-config JSON for a
+        hub-registered worker (role ``decode`` or ``prefill``).
+
+        Matches the hub's must-match register check by construction (same
+        block_layout / max_seq_len as the hub flags), so no runtime ``kvbmctl``
+        render is needed. Remote-search is role-keyed: ON for decode (override
+        ``kvbm_hub.remote_search``), explicitly OFF for prefill (override
+        ``kvbm_hub.remote_search_prefill``). A prefill declares only ``disagg``
+        (no ``indexer``), so enabling remote-search there trips the connector's
+        startup validator — keep it off unless the prefill also carries indexer.
+        """
+        h = self.kvbm_hub
+        assert h is not None
+        leader: dict[str, Any] = {
+            "hub": {"url": hub_url, "features": [f.strip() for f in h.features.split(",") if f.strip()]},
+            "max_seq_len": self.kvbm_max_seq_len(),
+            "cache": {"host": {"cache_size_gb": float(h.host_cache_gb)}},
+            "disagg": {"role": role},
+            "onboard": {"mode": h.onboard_mode},
+        }
+        if role == "decode":
+            leader["disagg"]["min_remote_prefill_tokens"] = int(h.min_remote_prefill_tokens)
+            if h.remote_search:
+                leader["remote_search"] = {"enabled": True}
+        elif role == "prefill":
+            # Pure CD target: remote-search OFF explicitly (provable in the static
+            # config, not reliant on a connector default). Overridable, but only
+            # valid if the prefill also carries the indexer feature.
+            leader["remote_search"] = {"enabled": bool(h.remote_search_prefill)}
+        cfg = {
+            "kv_connector": "DynamoConnector",
+            "kv_role": "kv_both",
+            "kv_connector_module_path": h.connector_module_path,
+            "kv_connector_extra_config": {
+                "default": {"block_layout": h.block_layout},
+                "leader": leader,
+                "worker": {"nixl": {"backends": {"UCX": {}, "POSIX": {}}}},
+            },
+        }
+        return json.dumps(cfg)
+
+    def build_kvbm_prefill_command(self, runtime: RuntimeContext, tp: int, hub_url: str) -> list[str]:
+        """Build the `python -m kvbm.vllm.prefill` command for a hub-owned prefill
+        ASIDE worker (NOT a dynamo endpoint).
+
+        Joins the hub prefill-router velo fleet via the kvbm v2 connector
+        (role=prefill, remote_search off). kvbm.vllm.prefill reuses vLLM's arg
+        parser, so the flags pass through identically. model / TP / EP / max-len
+        mirror the decode plane (TP may differ via kvbm_prefill_tp).
+        """
+        assert self.kvbm_hub is not None
+        model_arg = str(runtime.model_path) if runtime.is_hf_model else "/model"
+        served = self.get_served_model_name(runtime.model_path.name)
+        agg = (self.vllm_config.aggregated if self.vllm_config else None) or {}
+        gmu = agg.get("gpu-memory-utilization") or agg.get("gpu_memory_utilization") or 0.85
+        cmd = [
+            "python3",
+            "-m",
+            "kvbm.vllm.prefill",
+            "--model",
+            model_arg,
+            "--served-model-name",
+            served,
+            "--tensor-parallel-size",
+            str(tp),
+            "--gpu-memory-utilization",
+            str(gmu),
+            "--block-size",
+            str(self.kvbm_block_size()),
+            "--max-model-len",
+            str(self.kvbm_max_seq_len()),
+        ]
+        if agg.get("enable-expert-parallel") or agg.get("enable_expert_parallel"):
+            cmd.append("--enable-expert-parallel")
+        cmd.extend(["--kv-transfer-config", self.build_kvbm_hub_connector("prefill", hub_url)])
+        return cmd
 
     def should_colocate_prefill_decode(
         self,
@@ -385,14 +551,33 @@ class VLLMProtocol:
             cmd.extend(["--disaggregation-mode", mode])
 
         # KV connector → --kv-transfer-config (dynamo 1.0.0+: --connector was removed)
-        # Check for mode-specific override first, then fall back to default.
-        # Pop from config so it doesn't get added again by _config_to_cli_args.
-        mode_connector = config.pop("connector", None)
-        connector = mode_connector if mode_connector is not None else self.connector
+        if self.kvbm_hub is not None and mode == "agg":
+            # Decode plane: register the kvbm v2 connector against the hub on the
+            # infra node (role=decode). Decode runs AGGREGATED (note: no
+            # --disaggregation-mode above for "agg") so the KV-event publisher
+            # stays alive and the in-process consolidator relays to the dynamo
+            # KV-router. Prefix-caching + kv-events are REQUIRED for that relay.
+            config.pop("connector", None)
+            hub_url = f"http://{runtime.nodes.infra}:{KVBM_HUB_DISCOVERY_PORT}"
+            cmd.extend(["--kv-transfer-config", self.build_kvbm_hub_connector("decode", hub_url)])
+            # Force prefix-caching ON (the consolidator hard-requires it); drop any
+            # recipe no-enable-prefix-caching that would silently blind the router.
+            config.pop("no-enable-prefix-caching", None)
+            config.pop("no_enable_prefix_caching", None)
+            config["enable-prefix-caching"] = True
+            # Emit vLLM KV events on the per-worker ZMQ port (the consolidator's source).
+            if process.kv_events_port is not None:
+                kv_events = {"endpoint": f"tcp://*:{process.kv_events_port}", "enable_kv_cache_events": True}
+                cmd.extend(["--kv-events-config", json.dumps(kv_events)])
+        else:
+            # Check for mode-specific override first, then fall back to default.
+            # Pop from config so it doesn't get added again by _config_to_cli_args.
+            mode_connector = config.pop("connector", None)
+            connector = mode_connector if mode_connector is not None else self.connector
 
-        if connector and connector not in ("null", "none", None):
-            kv_transfer_cfg = _connector_to_kv_transfer_config(connector)
-            cmd.extend(["--kv-transfer-config", kv_transfer_cfg])
+            if connector and connector not in ("null", "none", None):
+                kv_transfer_cfg = _connector_to_kv_transfer_config(connector)
+                cmd.extend(["--kv-transfer-config", kv_transfer_cfg])
 
         # Check if this is DP+EP mode (data-parallel-size set)
         is_dp_mode = self._is_dp_mode(mode)

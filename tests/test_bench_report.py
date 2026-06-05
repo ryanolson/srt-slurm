@@ -26,7 +26,19 @@ from srtctl.analysis.bench_report import (
     recompute_goodput,
     render_html,
     summarize_errors,
+    write_csv,
 )
+
+
+def test_write_csv_is_lf_not_crlf(tmp_path):
+    """The CSV must use LF line endings: csv.DictWriter defaults to CRLF, which git
+    (core.safecrlf) refuses to add (`CRLF would be replaced by LF`)."""
+    run = _make_run("2187965", "agg-6xTEP2", is_baseline=True, req_s=1.74, itl_p50=17.0)
+    out = tmp_path / "latest_results.csv"
+    write_csv(out, [run])
+    data = out.read_bytes()
+    assert b"\r" not in data, "CSV must be LF-only (no CR)"
+    assert data.count(b"\n") >= 2  # header + at least one data row
 
 
 def test_summarize_errors_sums_buckets_not_categories():

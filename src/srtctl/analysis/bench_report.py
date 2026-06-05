@@ -1092,9 +1092,9 @@ def render_markdown(
     )
     lines.append("")
     lines.append(
-        "| job | native SLA | native gp (aiperf) | native gp (recompute) | user SLA | user gp | median ITL | discriminatory? |"
+        "| job | topology | native SLA | native gp (aiperf) | native gp (recompute) | user SLA | user gp | median ITL | discriminatory? |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for run in runs:
         ng = run.native_goodput_recompute
         ug = run.user_goodput
@@ -1113,7 +1113,7 @@ def render_markdown(
         user_gp = f"{ug.fraction:.3f} ({ug.good}/{ug.denom})" if ug.fraction is not None else "N/A"
         disc = "yes" if ug.discriminatory else "**NO (relax ITL SLA)**"
         lines.append(
-            f"| {run.job_id} | {native_sla} | {native_aiperf} | {native_recompute} | "
+            f"| {run.job_id} | {run.topology_label} | {native_sla} | {native_aiperf} | {native_recompute} | "
             f"{user_sla} | {user_gp} | {fmt(ug.median_itl_ms, 1)}ms | {disc} |"
         )
     lines.append("")
@@ -1145,19 +1145,19 @@ def render_markdown(
         )
     else:
         lines.append(
-            "| job | local | remote | remote% | remote prefill tok | prefill computed tok | declined | downgrades |"
+            "| job | topology | local | remote | remote% | remote prefill tok | prefill computed tok | declined | downgrades |"
         )
-        lines.append("|---|---|---|---|---|---|---|---|")
+        lines.append("|---|---|---|---|---|---|---|---|---|")
         for run in runs:
             cd = run.cd
             if not cd.present:
                 why = "no CD content" if cd.snapshot_found else "no snapshot"
-                lines.append(f"| {run.job_id} | _N/A ({why})_ | | | | | | |")
+                lines.append(f"| {run.job_id} | {run.topology_label} | _N/A ({why})_ | | | | | | |")
                 continue
             declined = ", ".join(f"{k}={v}" for k, v in sorted(cd.declined_by_reason.items())) or "-"
             downgr = ", ".join(f"{k}={v}" for k, v in sorted(cd.downgrades.items())) or "-"
             lines.append(
-                f"| {run.job_id} | {cd.local_decisions} | {cd.remote_decisions} | "
+                f"| {run.job_id} | {run.topology_label} | {cd.local_decisions} | {cd.remote_decisions} | "
                 f"{fmt(cd.remote_fraction, 3)} | {cd.remote_prefill_tokens} | "
                 f"{cd.prefill_computed_tokens} | {declined} | {downgr} |"
             )
@@ -1173,13 +1173,13 @@ def render_markdown(
     )
     lines.append("")
     lines.append(
-        "| job | total_blocks | block_size | G1 tok cap | util_max% | local prefix-hit | kv_reused_blk | kv_missed_blk | ext-cache-hit (proxy) | theoretical prefix-hit |"
+        "| job | topology | total_blocks | block_size | G1 tok cap | util_max% | local prefix-hit | kv_reused_blk | kv_missed_blk | ext-cache-hit (proxy) | theoretical prefix-hit |"
     )
-    lines.append("|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
     for run in runs:
         kv = run.kv
         lines.append(
-            f"| {run.job_id} | {fmt(kv.total_kv_blocks, 0)} | {fmt(kv.block_size, 0)} | "
+            f"| {run.job_id} | {run.topology_label} | {fmt(kv.total_kv_blocks, 0)} | {fmt(kv.block_size, 0)} | "
             f"{fmt(kv.kv_token_capacity, 0)} | {fmt(kv.util_max_perc, 1)} | {fmt(kv.local_prefix_hit_rate, 4)} | "
             f"{fmt(kv.kv_reused_blocks, 0)} | {fmt(kv.kv_missed_blocks, 0)} | "
             f"{fmt(kv.external_prefix_hits, 0)} | {fmt(run.theoretical_prefix_cache_hit, 1, '%')} |"
@@ -1651,7 +1651,9 @@ def csv_rows(runs: list[RunReport]) -> tuple[list[str], list[dict[str, Any]]]:
 def write_csv(path: Path, runs: list[RunReport]) -> None:
     fields, rows = csv_rows(runs)
     with path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        # lineterminator="\n" (not the csv default "\r\n"): with newline="" the default
+        # would write CRLF verbatim, which git (core.safecrlf) refuses to add. Keep LF.
+        w = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         w.writeheader()
         for row in rows:
             w.writerow(row)

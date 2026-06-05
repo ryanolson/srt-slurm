@@ -530,6 +530,85 @@ class TestDryRunKvbmHub:
         assert cfg2.get("enable-prefix-caching") is True
         assert "--kv-events-config" not in cmd2
 
+    def test_kvbm_consolidator_prefill_disagg_pd_connector(self):
+        """TRADITIONAL (native dynamo) P/D disagg with KVBM on the PREFILL workers:
+        kvbm_consolidator=True (hub-less) now also applies the consolidator treatment to a
+        mode=='prefill' worker (force prefix-caching ON + emit per-worker KV events), while a
+        plain-vLLM decode worker stays untouched (no kvbm, no kv-events, no forced prefix
+        caching). The prefill connector is a PdConnector wrapping DynamoConnector(+leader) +
+        NixlConnector so KV still transfers prefill->decode over NIXL."""
+        import json
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from srtctl.core.topology import Process
+
+        pd_connector = json.dumps(
+            {
+                "kv_connector": "PdConnector",
+                "kv_role": "kv_both",
+                "kv_connector_module_path": "kvbm.v2.vllm.connector",
+                "kv_connector_extra_config": {
+                    "connectors": [
+                        {
+                            "kv_connector": "DynamoConnector",
+                            "kv_role": "kv_both",
+                            "kv_connector_module_path": "kvbm.v2.vllm.connector",
+                            "kv_connector_extra_config": {
+                                "default": {"block_layout": "operational"},
+                                "leader": {"cache": {"host": {"cache_size_gb": 160.0}}, "max_seq_len": 262144},
+                                "worker": {"nixl": {"backends": {"UCX": {}, "POSIX": {}}}},
+                            },
+                        },
+                        {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+                    ]
+                },
+            }
+        )
+        backend = VLLMProtocol(
+            kvbm_consolidator=True,
+            vllm_config=VLLMServerConfig(
+                prefill={"connector": pd_connector, "block-size": 64, "max-model-len": 262144},
+                decode={"connector": "nixl"},
+            ),
+        )
+
+        def _cmd(mode: str) -> list[str]:
+            proc = Process(
+                node="node0",
+                gpu_indices=frozenset([0, 1]),
+                sys_port=8081,
+                http_port=30000,
+                endpoint_mode=mode,
+                endpoint_index=0,
+                node_rank=0,
+                kv_events_port=5200,
+            )
+            rt = MagicMock()
+            rt.model_path = Path("/model")
+            rt.is_hf_model = False
+            with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
+                return backend.build_worker_command(process=proc, endpoint_processes=[proc], runtime=rt)
+
+        # PREFILL: gets the PdConnector + consolidator wiring.
+        p = _cmd("prefill")
+        assert "--disaggregation-mode" in p and p[p.index("--disaggregation-mode") + 1] == "prefill"
+        assert "--kv-transfer-config" in p
+        ktc = json.loads(p[p.index("--kv-transfer-config") + 1])
+        assert ktc["kv_connector"] == "PdConnector"
+        child_kinds = {c["kv_connector"] for c in ktc["kv_connector_extra_config"]["connectors"]}
+        assert child_kinds == {"DynamoConnector", "NixlConnector"}
+        assert "--enable-prefix-caching" in p  # consolidator hard-requires it on prefill
+        assert "--kv-events-config" in p  # the consolidator's KV-events source
+
+        # DECODE: plain vLLM NIXL — NO kvbm consolidator wiring.
+        d = _cmd("decode")
+        assert "--disaggregation-mode" in d and d[d.index("--disaggregation-mode") + 1] == "decode"
+        dktc = json.loads(d[d.index("--kv-transfer-config") + 1])
+        assert dktc["kv_connector"] == "NixlConnector"
+        assert "--kv-events-config" not in d  # decode does NOT publish kvbm KV events
+        assert "--enable-prefix-caching" not in d  # not forced on the plain decode worker
+
     def test_kvbm_consolidator_gets_per_worker_zmq_ports(self):
         """The hub-less consolidator path MUST get the per-worker DYN_KVBM_LEADER_ZMQ_PUB_PORT
         offset (like the hub path), else 2 bin-packed agg workers/node collide on the default

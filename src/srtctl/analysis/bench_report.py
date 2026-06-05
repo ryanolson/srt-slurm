@@ -140,6 +140,27 @@ def _pct(metric: dict[str, Any] | None, pct: str) -> float | None:
     return metric.get(pct)
 
 
+def _compute_active_gpus(r: Any) -> int:
+    """Active GPUs across the serving plane (NOT provisioned nodes).
+
+    Three serving modes:
+    - aggregated: ``num_agg * gpus_per_agg`` (+ CD prefill-aside if any).
+    - CD (decode-AGG + hub-owned prefill aside): ``num_agg * gpus_per_agg +
+      kvbm_prefill_nodes * kvbm_prefill_tp``.
+    - native (trad) P/D disagg: ``num_decode * gpus_per_decode + num_prefill *
+      gpus_per_prefill`` — BOTH planes count. (Earlier this omitted the native
+      prefill plane, halving the per-GPU denominator for trad-P/D runs.)
+    """
+    prefill_nodes = r.kvbm_prefill_nodes or 0  # CD prefill-aside (0 for native disagg)
+    prefill_tp = r.kvbm_prefill_tp or 0
+    gpus = r.num_agg * r.gpus_per_agg + prefill_nodes * prefill_tp
+    if not gpus and r.num_decode:
+        # native P/D disagg: count the native prefill plane too (num_prefill is 0 for
+        # agg/CD, so this term only fires for trad-P/D and never perturbs agg/CD).
+        gpus = r.num_decode * r.gpus_per_decode + r.num_prefill * r.gpus_per_prefill + prefill_nodes * prefill_tp
+    return gpus
+
+
 def parse_cli_goodput_sla(cli_command: str | None) -> tuple[float | None, float | None]:
     """Recover the NATIVE goodput SLA (ttft_ms, itl_ms) from the cli_command.
 
@@ -627,6 +648,11 @@ def _topology_label(cfg_resources: Any, is_baseline: bool) -> tuple[str, int | N
     agg = cfg_resources.num_agg
     tp = cfg_resources.gpus_per_agg if agg else cfg_resources.gpus_per_decode
     pn = cfg_resources.kvbm_prefill_nodes or 0
+    # Native (trad) P/D disagg: no agg plane, distinct prefill+decode planes (num_agg==0,
+    # num_prefill>0, num_decode>0). MUST be checked FIRST — these runs are is_baseline (no
+    # kvbm_hub) with pn==0, so the agg branch below would otherwise mislabel them "agg-0xTEP2".
+    if agg == 0 and cfg_resources.num_prefill > 0 and cfg_resources.num_decode > 0:
+        return f"pd-{cfg_resources.num_prefill}p{cfg_resources.num_decode}d TEP{tp}", tp
     if is_baseline or pn == 0:
         return f"agg-{agg}xTEP{tp}", tp
     return f"cd-{agg}d{pn}p TEP{tp}", tp
@@ -656,10 +682,8 @@ def build_run_report(
     _vc = getattr(cfg.backend, "vllm_config", None)
     _agg = getattr(_vc, "aggregated", None) if _vc else None
     max_num_tokens = _agg.get("max-model-len") if isinstance(_agg, dict) else None
-    # ACTIVE GPUs = agg plane + the prefill aside (NOT provisioned).
-    active_gpus = r.num_agg * r.gpus_per_agg + prefill_nodes * prefill_tp
-    if not active_gpus and r.num_decode:
-        active_gpus = r.num_decode * r.gpus_per_decode + prefill_nodes * prefill_tp
+    # ACTIVE GPUs across the serving plane (NOT provisioned nodes).
+    active_gpus = _compute_active_gpus(r)
     try:
         provisioned_nodes = r.total_nodes
     except Exception:  # noqa: BLE001
@@ -834,6 +858,16 @@ class Manifest:
     # (the threshold is read from each run's condp_policy); may overlap `runs` (the anchor).
     sweep_job_ids: list[str] = field(default_factory=list)
     sweep_note: str = ""
+    # Optional parallel axis: traditional (native dynamo) P/D disaggregation runs, a distinct
+    # serving mode rendered in its own section. Carry explicit labels (the auto topology_label
+    # mislabels native P/D as "agg-0xTEP2"). Ordered ManifestRuns (job_id + label).
+    pd_disagg_runs: list[ManifestRun] = field(default_factory=list)
+    pd_disagg_note: str = ""
+    # Optional parallel axis: the Pareto frontier (output tok/s/user p50 vs output tok/s/GPU),
+    # one line per serving mode across a concurrency sweep, rendered as a PNG. Ordered job ids
+    # (may overlap `runs`); the line key is each run's topology_label.
+    pareto_job_ids: list[str] = field(default_factory=list)
+    pareto_note: str = ""
     source_path: Path | None = None
 
     def baseline_run(self) -> ManifestRun | None:
@@ -903,6 +937,42 @@ def parse_manifest(path: Path) -> Manifest:
         elif isinstance(entry, (str, int)):
             sweep_job_ids.append(str(entry))
 
+    # Optional trad P/D disagg: `pd_disagg: {note?, runs: [{job_id, label, note?}, ...]}`.
+    pd_disagg_runs: list[ManifestRun] = []
+    pd_disagg_note = ""
+    pd_block = data.get("pd_disagg")
+    if isinstance(pd_block, dict):
+        pd_disagg_note = str(pd_block.get("note", ""))
+        for entry in pd_block.get("runs") or []:
+            if isinstance(entry, dict) and entry.get("job_id") is not None:
+                pd_disagg_runs.append(
+                    ManifestRun(
+                        job_id=str(entry.get("job_id")),
+                        label=str(entry.get("label", entry.get("job_id"))),
+                        kind=str(entry.get("kind", KIND_CD)),
+                        tpcb=bool(entry.get("tpcb", False)),
+                        note=str(entry.get("note", "")),
+                    )
+                )
+
+    # Optional Pareto axis: `pareto: {note?, runs: [{job_id}, ...]}` (also tolerates a bare list
+    # of {job_id}). Ordered; the per-mode line key is each run's topology_label. Mirrors threshold_sweep.
+    pareto_job_ids: list[str] = []
+    pareto_note = ""
+    pareto_block = data.get("pareto")
+    if isinstance(pareto_block, dict):
+        pareto_note = str(pareto_block.get("note", ""))
+        pareto_entries = pareto_block.get("runs") or []
+    elif isinstance(pareto_block, list):
+        pareto_entries = pareto_block
+    else:
+        pareto_entries = []
+    for entry in pareto_entries:
+        if isinstance(entry, dict) and entry.get("job_id") is not None:
+            pareto_job_ids.append(str(entry.get("job_id")))
+        elif isinstance(entry, (str, int)):
+            pareto_job_ids.append(str(entry))
+
     return Manifest(
         title=str(data.get("title", "KVBM benchmark report")),
         dataset=(str(data["dataset"]) if data.get("dataset") is not None else None),
@@ -912,6 +982,10 @@ def parse_manifest(path: Path) -> Manifest:
         runs=runs,
         sweep_job_ids=sweep_job_ids,
         sweep_note=sweep_note,
+        pd_disagg_runs=pd_disagg_runs,
+        pd_disagg_note=pd_disagg_note,
+        pareto_job_ids=pareto_job_ids,
+        pareto_note=pareto_note,
         source_path=path,
     )
 
@@ -1045,6 +1119,148 @@ def render_threshold_sweep(sweep_runs: list[RunReport], note: str = "") -> str:
             )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Traditional (native dynamo) P/D disaggregation (distinct serving mode — its own section)
+# ---------------------------------------------------------------------------
+
+_PD_DISAGG_THESIS = (
+    "**Traditional (native dynamo) prefill/decode disaggregation — a 3rd serving mode alongside "
+    "aggregated and CD.** Configured for KV-aware P-first routing (`router-mode: kv`, requests sized "
+    "on a prefill worker first); the prefill workers run KVBM + the in-process consolidator (G2 "
+    "160GB/rank, same as agg/CD) and hand KV to plain-vLLM decode workers over NIXL. Sweeping the "
+    "prefill:decode split at fixed total GPUs (6 nodes × 2-GPU TEP2). `kv_reused_blk` > 0 proves the "
+    "KVBM-on-prefill consolidator engaged (this prefill-disagg+KVBM shape had no prior live precedent "
+    "here); the prefill-side local prefix-hit rates are comparable to the KV-routed CD runs, "
+    "consistent with KV-routing working — though the router's runtime overlap-scoring was not directly "
+    "confirmed. READING THE NUMBERS: at this (unsaturated) c48 load the throughput differences between "
+    "the best split and agg / CD-3d3p in §1-2 are within run-noise — do NOT over-read a few-percent "
+    "edge. The above-noise signals are (1) the whole native-P/D family sits ~9% BELOW CD-5d1p (1.94 "
+    "req/s) — the CD prefill-aside wins in this huge-prefix (~85k ISL) workload — and (2) the TTFT-p50 "
+    "spread across the split (4p2d ~886ms prefill-rich but decode-bound → 2p4d ~6556ms prefill-starved) "
+    "is the real prefill:decode tradeoff. Among the splits the balanced 3p3d is the throughput sweet spot."
+)
+
+
+def _pd_disagg_valid(rr: RunReport) -> bool:
+    """A trad-P/D run is valid iff it actually served traffic (req/s>0, requests>0, no all-error)."""
+    return bool(rr.request_throughput) and bool(rr.request_count) and (rr.error_count or 0) < (rr.request_count or 0)
+
+
+def render_pd_disagg(paired: list[tuple[ManifestRun, RunReport]], note: str = "") -> str:
+    """Section 8: traditional P/D disaggregation runs (one row per prefill:decode split).
+
+    Uses the manifest LABEL (the auto topology_label mislabels native P/D as 'agg-0xTEP2').
+    Invalid runs (all requests errored) are shown but explicitly flagged, never silently dropped."""
+    lines: list[str] = []
+    lines.append("## 8. Traditional P/D disaggregation")
+    lines.append("")
+    lines.append(_PD_DISAGG_THESIS)
+    lines.append("")
+    if note:
+        lines.append(f"> {note}")
+        lines.append("")
+    lines.append(
+        "| config | conc | job | req/s | out tok/s | TTFT p50 | TTFT p90 | ITL p50 | ITL p90 | reqs | kv_reused_blk | status |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+    # order by (concurrency, req/s desc) so each concurrency block is grouped, best on top
+    ordered = sorted(paired, key=lambda pr: (pr[1].concurrency or 0, -(pr[1].request_throughput or 0.0)))
+    for mr, rr in ordered:
+        if _pd_disagg_valid(rr):
+            status = "valid"
+        else:
+            why = f"all requests errored ({rr.runtime_error})" if rr.runtime_error else "no served traffic"
+            status = f"**INVALID — {why}**"
+        lines.append(
+            f"| {mr.label} | {rr.concurrency if rr.concurrency is not None else 'N/A'} | {rr.job_id} | "
+            f"{fmt(rr.request_throughput, 3)} | {fmt(rr.output_tput, 0)} | "
+            f"{fmt(rr.ttft_p50, 0)} | {fmt(rr.ttft_p90, 0)} | {fmt(rr.itl_p50, 1)} | {fmt(rr.itl_p90, 1)} | "
+            f"{rr.request_count if rr.request_count is not None else 'N/A'} | {fmt(rr.kv.kv_reused_blocks, 0)} | {status} |"
+        )
+    lines.append("")
+    # Best valid split PER concurrency (req/s is only comparable within a concurrency).
+    valid_pairs = [(mr, rr) for mr, rr in paired if _pd_disagg_valid(rr)]
+    by_conc: dict[int, list[tuple[ManifestRun, RunReport]]] = {}
+    for mr, rr in valid_pairs:
+        by_conc.setdefault(rr.concurrency or -1, []).append((mr, rr))
+    for conc in sorted(by_conc):
+        mr, rr = max(by_conc[conc], key=lambda pr: pr[1].request_throughput or 0.0)
+        lines.append(
+            f"- **Best valid trad-P/D @ c{conc}: {mr.label}** ({fmt(rr.request_throughput, 3)} req/s, "
+            f"{fmt(rr.output_tput, 0)} out tok/s, TTFT p50 {fmt(rr.ttft_p50, 0)}ms)."
+        )
+    if valid_pairs:
+        lines.append(f"- {len(valid_pairs)}/{len(paired)} configs valid.")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Pareto frontier (output tok/s/user p50 vs output tok/s/GPU, one line per mode)
+# ---------------------------------------------------------------------------
+
+
+def _pareto_series(runs: list[RunReport]) -> dict[str, list[tuple[float, float, int | None, float | None]]]:
+    """Group runs by topology_label (the serving-mode line key) into plottable point series.
+
+    Each point is ``(x, y, concurrency, ttft_p50)`` where x = output tok/s/user (p50) and
+    y = output tok/s/GPU. Runs missing x or y are dropped (can't be plotted). Each series is
+    sorted by concurrency so the line traces the concurrency sweep. Matplotlib-free so it is
+    unit-testable without rendering."""
+    series: dict[str, list[tuple[float, float, int | None, float | None]]] = {}
+    for r in runs:
+        x = r.output_tput_per_user
+        y = r.output_tput_per_gpu
+        if x is None or y is None:
+            continue
+        series.setdefault(r.topology_label, []).append((x, y, r.concurrency, r.ttft_p50))
+    for pts in series.values():
+        pts.sort(key=lambda p: p[2] if p[2] is not None else -1)
+    return series
+
+
+def render_pareto_png(pareto_runs: list[RunReport], out_path: Path, title: str) -> bool:
+    """Render a Pareto-frontier PNG: x = output tok/s/user (p50), y = output tok/s/GPU.
+
+    One line+marker series per serving mode (``topology_label`` — correct after the native-disagg
+    label fix), in sorted order for stable colors from the default cycle, with each series sorted by
+    concurrency. Every point is annotated ``c{concurrency}, {ttft_p50:.0f}ms``. Returns True iff at
+    least one point was plotted (so the caller can gate the markdown/HTML embeds)."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    series = _pareto_series(pareto_runs)
+    if not series:
+        return False  # nothing plottable — skip writing an empty PNG the caller would not embed
+    fig, ax = plt.subplots(figsize=(9, 6))
+    plotted = 0
+    for label in sorted(series):
+        pts = series[label]
+        if not pts:
+            continue
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        ax.plot(xs, ys, marker="o", label=label)
+        for x, y, conc, ttft in pts:
+            ann = f"c{conc}"
+            if ttft is not None:
+                ann += f", {ttft:.0f}ms"
+            ax.annotate(ann, (x, y), fontsize=8, xytext=(4, 4), textcoords="offset points")
+        plotted += len(pts)
+
+    ax.set_xlabel("output tok/s/user (p50)")
+    ax.set_ylabel("output tok/s/GPU")
+    ax.set_title(title)
+    ax.grid(True)
+    if plotted:
+        ax.legend()
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return plotted >= 1
 
 
 # ---------------------------------------------------------------------------
@@ -1533,6 +1749,8 @@ def render_html(
     ttft_sla_ms: float,
     itl_sla_ms: float,
     sweep_runs: list[RunReport] | None = None,
+    pd_paired: list[tuple[ManifestRun, RunReport]] | None = None,
+    pareto_png_name: str | None = None,
 ) -> str:
     """Render a SELF-CONTAINED HTML report from a curated manifest.
 
@@ -1698,6 +1916,47 @@ def render_html(
                 ]
                 out.append("<tr>" + "".join(f"<td>{_esc(c)}</td>" for c in cells) + "</tr>")
             out.append("</tbody></table>")
+
+    # ---- Traditional P/D disaggregation (distinct serving mode) ----
+    if pd_paired:
+        out.append("<h2>Traditional P/D disaggregation</h2>")
+        out.append(f"<p class='note'>{_md_inline_to_html(_PD_DISAGG_THESIS)}</p>")
+        if manifest.pd_disagg_note:
+            out.append(f"<p class='caveat'>{_esc(manifest.pd_disagg_note)}</p>")
+        out.append("<table><thead><tr>")
+        for h in ("config", "conc", "job", "req/s", "out tok/s", "TTFT p50", "TTFT p90", "ITL p50", "ITL p90", "reqs", "kv_reused_blk", "status"):
+            out.append(f"<th>{_esc(h)}</th>")
+        out.append("</tr></thead><tbody>")
+        for mr, rr in sorted(pd_paired, key=lambda pr: (pr[1].concurrency or 0, -(pr[1].request_throughput or 0.0))):
+            valid = _pd_disagg_valid(rr)
+            status = "valid" if valid else f"INVALID — {rr.runtime_error or 'no served traffic'}"
+            cells = [
+                mr.label, (rr.concurrency if rr.concurrency is not None else "N/A"), rr.job_id,
+                fmt(rr.request_throughput, 3), fmt(rr.output_tput, 0),
+                fmt(rr.ttft_p50, 0), fmt(rr.ttft_p90, 0), fmt(rr.itl_p50, 1), fmt(rr.itl_p90, 1),
+                str(rr.request_count if rr.request_count is not None else "N/A"), fmt(rr.kv.kv_reused_blocks, 0), status,
+            ]
+            tdcls = "" if valid else " class='errors-yes'"
+            out.append("<tr>" + "".join(f"<td{tdcls}>{_esc(c)}</td>" for c in cells) + "</tr>")
+        out.append("</tbody></table>")
+
+    # ---- Pareto frontier (relative PNG embed; emitted only when the PNG was written) ----
+    # NOTE: this is the one place the report references an external asset (the sibling PNG, same
+    # dir). The "self-contained" guard (no ` src=`) is intentionally relaxed for this embed, same
+    # as the markdown relative image — so render_html only emits the <img> when a name is passed.
+    if pareto_png_name:
+        out.append("<h2>Pareto frontier</h2>")
+        if manifest.pareto_note:
+            out.append(f"<p class='note'>{_esc(manifest.pareto_note)}</p>")
+        out.append(
+            f'<img src="{_esc(pareto_png_name)}" '
+            'alt="Pareto: output tok/s/user (p50) vs output tok/s/GPU" '
+            'style="max-width:100%;height:auto">'
+        )
+        out.append(
+            "<p class='legend'>Each line is a serving mode (agg / CD / trad-P/D) traced across the "
+            "concurrency sweep; each point is labelled (concurrency, TTFT p50).</p>"
+        )
 
     # ---- Per-run provenance footer ----
     out.append("<h2>Per-run provenance</h2>")
@@ -1973,7 +2232,40 @@ def run_manifest_mode(args: argparse.Namespace) -> int:
             if rr is not None:
                 sweep_runs.append(rr)
 
-    html_doc = render_html(manifest, paired, args.ttft_sla_ms, args.itl_sla_ms, sweep_runs)
+    # Trad P/D disagg (distinct serving mode): build paired (ManifestRun, RunReport) for the label.
+    pd_paired: list[tuple[ManifestRun, RunReport]] = []
+    if manifest.pd_disagg_runs:
+        by_id = {rr.job_id: rr for rr in runs}
+        for mr in manifest.pd_disagg_runs:
+            rr = by_id.get(mr.job_id) or _build_run(mr.job_id, args.ttft_sla_ms, args.itl_sla_ms)
+            if rr is not None:
+                pd_paired.append((mr, rr))
+
+    # Pareto frontier (parallel axis): build RunReports for the pareto job ids (reusing the
+    # already-built main runs by job id, like sweep/pd) so each dir is parsed once.
+    pareto_runs: list[RunReport] = []
+    if manifest.pareto_job_ids:
+        by_id = {rr.job_id: rr for rr in runs}
+        for jid in manifest.pareto_job_ids:
+            rr = by_id.get(jid) or _build_run(jid, args.ttft_sla_ms, args.itl_sla_ms)
+            if rr is not None:
+                pareto_runs.append(rr)
+
+    # Output dir/stem computed up front: the PNG path + the written-bool gate the HTML img and md §9.
+    out_dir = Path(args.out_dir).resolve() if args.out_dir else manifest_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = manifest_path.stem
+
+    # Write the Pareto PNG (if any pareto runs) and only then reference it from the HTML/md.
+    pareto_png_name: str | None = None
+    if pareto_runs:
+        png_name = f"{stem}_pareto.png"
+        title = f"{manifest.title} — Pareto frontier"
+        if render_pareto_png(pareto_runs, out_dir / png_name, title):
+            pareto_png_name = png_name
+            logger.info("Wrote %s", out_dir / png_name)
+
+    html_doc = render_html(manifest, paired, args.ttft_sla_ms, args.itl_sla_ms, sweep_runs, pd_paired, pareto_png_name)
 
     # md + csv reuse the existing renderers (grouping + explicit baseline by kind).
     base_mr = manifest.baseline_run()
@@ -1982,10 +2274,22 @@ def run_manifest_mode(args: argparse.Namespace) -> int:
     md = render_markdown(runs, groups, explicit_baseline, args.ttft_sla_ms, args.itl_sla_ms)
     if sweep_runs:
         md = md.rstrip() + "\n\n" + render_threshold_sweep(sweep_runs, manifest.sweep_note)
+    if pd_paired:
+        md = md.rstrip() + "\n\n" + render_pd_disagg(pd_paired, manifest.pd_disagg_note)
+    # §9 Pareto frontier: a GitHub/GitLab-renderable RELATIVE image embed (filename only, same dir).
+    if pareto_png_name:
+        pareto_md = ["## 9. Pareto frontier", ""]
+        if manifest.pareto_note:
+            pareto_md.append(f"> {manifest.pareto_note}")
+            pareto_md.append("")
+        pareto_md.append(f"![Pareto: output tok/s/user (p50) vs output tok/s/GPU]({pareto_png_name})")
+        pareto_md.append("")
+        pareto_md.append(
+            "Each line is a serving mode (agg / CD / trad-P/D) traced across the concurrency sweep; "
+            "each point is labelled (concurrency, TTFT p50)."
+        )
+        md = md.rstrip() + "\n\n" + "\n".join(pareto_md) + "\n"
 
-    out_dir = Path(args.out_dir).resolve() if args.out_dir else manifest_path.parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    stem = manifest_path.stem
     html_path = out_dir / f"{stem}.html"
     html_path.write_text(html_doc)
     logger.info("Wrote %s", html_path)
@@ -2002,6 +2306,11 @@ def run_manifest_mode(args: argparse.Namespace) -> int:
             sweep_csv = out_dir / f"{stem}_threshold_sweep.csv"
             write_csv(sweep_csv, sweep_runs)
             logger.info("Wrote %s", sweep_csv)
+        # Sibling CSV for the trad-P/D serving mode (full schema, every split).
+        if pd_paired:
+            pd_csv = out_dir / f"{stem}_pd_disagg.csv"
+            write_csv(pd_csv, [rr for _, rr in pd_paired])
+            logger.info("Wrote %s", pd_csv)
     return 0
 
 

@@ -92,7 +92,8 @@ backend:
   kvbm_hub:
     hub_binary: "/opt/kvbm/bin/kvbm_hub"
     block_layout: operational           # symmetric TP (decode TEP2 == prefill TEP2)
-    min_remote_prefill_tokens: 1024     # Conditional Threshold = 1024 (the HEAVY config)
+    min_remote_prefill_tokens: 4096     # Conditional Threshold = 4096 (NEW DEFAULT; throughput-neutral
+                                        # per the §7 sweep, fewer/larger remote prefills, gentler on the breaker)
     # CIRCUIT BREAKER (router-sourced 3-tier; replaces the static B-GNMT max_inflight budget):
     cd_breaker_enabled: true
     cd_breaker_warm_high: 0.5           # trip CALM->WARM when prefill free-capacity-fraction < 0.5

@@ -19,7 +19,7 @@
 # circuit breaker). CD-leverage + breaker tier transitions captured by the post-benchmark
 # hub-metrics snapshot hook (Prometheus, so KVBM_CONTROL_METRICS=true suffices, RUST_LOG=error).
 
-name: "kvbm-cdg-5d1p-breaker-trace-replay-sa"
+name: "kvbm-cdg-5d1p-breaker-t4096-c96"
 
 identity:
   model:
@@ -91,8 +91,7 @@ backend:
   kvbm_hub:
     hub_binary: "/opt/kvbm/bin/kvbm_hub"
     block_layout: operational           # symmetric TP (decode TEP2 == prefill TEP2)
-    min_remote_prefill_tokens: 4096     # Conditional Threshold = 4096 (NEW DEFAULT; throughput-neutral
-                                        # per the §7 sweep, fewer/larger remote prefills, gentler on the breaker)
+    min_remote_prefill_tokens: 4096     # Conditional Threshold = 4096 (threshold sweep)
     # CIRCUIT BREAKER (router-sourced 3-tier; replaces the static B-GNMT max_inflight budget):
     cd_breaker_enabled: true
     cd_breaker_warm_high: 0.5           # trip CALM->WARM when prefill free-capacity-fraction < 0.5
@@ -119,7 +118,7 @@ benchmark:
   type: "trace-replay-sa"
   public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
   num_dataset_entries: 470           # full with-subagents 256k corpus (470 traces)
-  concurrencies: "48"
+  concurrencies: "96"
   ttft_threshold_ms: 5000
   itl_threshold_ms: 10
   aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"

@@ -179,13 +179,21 @@ class VLLMProtocol:
     # node separation.
     allow_prefill_decode_colocation: bool = False
 
-    # Aggregated KV-aware-routing baseline: enable the in-process KV consolidator +
-    # per-worker KV events on AGG workers using the recipe's raw kvbm v2 ``connector``,
-    # WITHOUT a hub or prefill aside. This is the CD decode plane's routing methodology
-    # (consolidator relays G1+G2 events to the dynamo KV-router; prefix-caching forced ON)
-    # minus the disagg sidecar — so an agg baseline routes iso with CD and the agg-vs-CD
-    # delta isolates conditional disaggregation. Requires a kvbm v2 ``connector`` + a
-    # KV-router frontend (router-mode: kv, router-kv-events: true). Ignored if kvbm_hub is set.
+    # Hub-less KVBM consolidator on the KV-routable workers: enable the in-process KV
+    # consolidator + per-worker KV events using the recipe's raw kvbm v2 ``connector``,
+    # WITHOUT a hub or hub-owned prefill aside. This is the CD decode plane's routing
+    # methodology (consolidator relays G1+G2 events to the dynamo KV-router; prefix-caching
+    # forced ON). Applies to:
+    #   - AGG workers (aggregated baseline) — routes iso with CD, isolating the agg-vs-CD
+    #     delta to conditional disaggregation; the ``connector`` is a standalone kvbm v2
+    #     DynamoConnector.
+    #   - PREFILL workers in TRADITIONAL (native dynamo) P/D disagg — KVBM offload +
+    #     consolidator live on prefill; decode is plain vLLM. The prefill ``connector`` must
+    #     be a PdConnector JSON wrapping [DynamoConnector(+leader), NixlConnector] so the
+    #     KV still transfers prefill->decode over NIXL. Set ``vllm_config.decode.connector:
+    #     nixl`` so this consolidator path never fires on the decode workers.
+    # Requires a KV-router frontend (router-mode: kv, router-kv-events: true). Ignored if
+    # kvbm_hub is set (the hub path owns its own decode-side consolidator wiring).
     kvbm_consolidator: bool = False
 
     Schema: ClassVar[builtins.type[Schema]] = Schema
@@ -242,6 +250,9 @@ class VLLMProtocol:
         # (kvbm_consolidator) — else 2 bin-packed agg workers/node both bind the default
         # port and EngineCore init fails. Mirrors worker_stage._apply_kvbm_endpoint_env
         # (DYN_CONNECTOR=kvbm path); our connector arrives via --kv-transfer-config.
+        # NOTE: this keys on kvbm_consolidator (not mode), so in traditional P/D disagg the
+        # plain-vLLM DECODE workers also receive these vars — harmless (a plain NixlConnector
+        # decode has no in-process consolidator/leader and simply ignores them).
         if (self.kvbm_hub is not None or self.kvbm_consolidator) and process.kv_events_port is not None:
             port_offset = max(0, process.kv_events_port - KV_EVENTS_PORT_BASE)
             pub_port = KVBM_ZMQ_PORT_BASE + (port_offset * 2)
@@ -633,11 +644,31 @@ class VLLMProtocol:
             hub_url = f"http://{runtime.nodes.infra}:{KVBM_HUB_DISCOVERY_PORT}"
             cmd.extend(["--kv-transfer-config", self.build_kvbm_hub_connector("decode", hub_url)])
             self._enable_kvbm_consolidator(cmd, config, process)
-        elif self.kvbm_consolidator and self.kvbm_hub is None and mode == "agg":
-            # Aggregated KV-aware-routing baseline: the SAME in-process consolidator +
-            # KV-router methodology as the CD decode plane, but WITHOUT the hub/prefill
-            # sidecar — use the recipe's RAW kvbm v2 connector (no leader.hub, no disagg).
-            # So agg routes iso with CD (G1+G2 dedup) and agg-vs-CD isolates disaggregation.
+        elif self.kvbm_consolidator and self.kvbm_hub is None and mode in ("agg", "prefill"):
+            # Hub-less KVBM consolidator on the KV-routable workers — the SAME in-process
+            # consolidator + KV-router methodology as the CD decode plane, but WITHOUT the
+            # hub/prefill sidecar. Two shapes share this branch:
+            #
+            #   mode == "agg"     — AGGREGATED KV-aware-routing baseline: the recipe's RAW
+            #                       kvbm v2 connector (a standalone DynamoConnector w/ leader,
+            #                       no leader.hub, no disagg) so agg routes iso with CD.
+            #   mode == "prefill" — TRADITIONAL (native dynamo) P/D disagg with KVBM on the
+            #                       PREFILL workers. The prefill worker must BOTH offload/
+            #                       consolidate (KVBM) AND hand the KV off to a plain-vLLM
+            #                       decode worker (NIXL), so the recipe supplies a PdConnector
+            #                       JSON that composes [DynamoConnector(+leader), NixlConnector]
+            #                       (see kvbm.vllm_integration.connector.pd_connector: child[0]
+            #                       = KVBM offload/onboard, child[1] = NIXL P->D transfer). The
+            #                       --disaggregation-mode prefill flag is emitted above. Decode
+            #                       workers stay in the else-branch (plain NIXL, no kvbm/
+            #                       consolidator) — set vllm_config.decode.connector: nixl so
+            #                       this branch never fires for them.
+            #
+            # Either way the connector arrives verbatim from the recipe (raw JSON), and
+            # _enable_kvbm_consolidator forces prefix-caching ON + emits the per-worker
+            # KV-events the in-process consolidator relays to the dynamo KV-router. The
+            # per-worker ZMQ leader ports are seeded by get_process_environment (which keys
+            # on kvbm_consolidator, independent of mode).
             mode_connector = config.pop("connector", None)
             connector = mode_connector if mode_connector is not None else self.connector
             if connector and connector not in ("null", "none", None):

@@ -180,6 +180,128 @@ def test_kv_metrics_empty_is_safe():
     assert km.kv_token_capacity is None
 
 
+def test_compute_active_gpus_all_serving_modes():
+    """active_gpus must count the full serving plane in all 3 modes — including the NATIVE
+    prefill plane for trad P/D disagg (which the old formula omitted, halving the per-GPU
+    denominator and inflating tok/s/GPU for trad-P/D runs)."""
+    from types import SimpleNamespace
+
+    from srtctl.analysis.bench_report import _compute_active_gpus
+
+    def res(**kw):
+        base = dict(
+            num_agg=0, gpus_per_agg=0, num_decode=0, gpus_per_decode=0,
+            num_prefill=0, gpus_per_prefill=0, kvbm_prefill_nodes=0, kvbm_prefill_tp=0,
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    # aggregated 6×TEP2 = 12
+    assert _compute_active_gpus(res(num_agg=6, gpus_per_agg=2)) == 12
+    # CD: 5 decode-AGG ×TEP2 + 1 hub prefill-aside ×TP2 = 12
+    assert _compute_active_gpus(res(num_agg=5, gpus_per_agg=2, kvbm_prefill_nodes=1, kvbm_prefill_tp=2)) == 12
+    # native P/D disagg (the fix): prefill plane + decode plane both count = 12
+    assert _compute_active_gpus(res(num_decode=3, gpus_per_decode=2, num_prefill=3, gpus_per_prefill=2)) == 12  # 3p3d
+    assert _compute_active_gpus(res(num_decode=2, gpus_per_decode=2, num_prefill=4, gpus_per_prefill=2)) == 12  # 4p2d
+    assert _compute_active_gpus(res(num_decode=4, gpus_per_decode=2, num_prefill=2, gpus_per_prefill=2)) == 12  # 2p4d
+
+
+def test_topology_label_agg_cd_and_native_disagg():
+    """_topology_label must label native (trad) P/D disagg as 'pd-<p>p<d>d TEP<tp>' (num_agg==0,
+    num_prefill>0, num_decode>0) — WITHOUT changing the agg label or the CD label. The native-disagg
+    case is is_baseline=True with pn==0, so it must be checked before the agg branch."""
+    from types import SimpleNamespace
+
+    from srtctl.analysis.bench_report import _topology_label
+
+    def res(**kw):
+        base = dict(
+            num_agg=0, gpus_per_agg=0, num_prefill=0, num_decode=0,
+            gpus_per_decode=0, kvbm_prefill_nodes=0,
+        )
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    # aggregated: num_agg>0, no prefill aside -> agg-<n>xTEP<gpus_per_agg> (UNCHANGED)
+    assert _topology_label(res(num_agg=6, gpus_per_agg=2), is_baseline=True) == ("agg-6xTEP2", 2)
+    # CD: num_agg>0 + a hub prefill aside -> cd-<agg>d<pn>p TEP<gpus_per_agg> (UNCHANGED)
+    assert _topology_label(res(num_agg=5, gpus_per_agg=2, kvbm_prefill_nodes=1), is_baseline=False) == (
+        "cd-5d1p TEP2",
+        2,
+    )
+    # native P/D disagg (the fix): no agg plane, distinct prefill+decode -> pd-3p3d TEP2.
+    # It is is_baseline=True with pn==0, so the agg branch would have mislabelled it 'agg-0xTEP2'.
+    assert _topology_label(
+        res(num_prefill=3, num_decode=3, gpus_per_decode=2), is_baseline=True
+    ) == ("pd-3p3d TEP2", 2)
+    assert _topology_label(
+        res(num_prefill=4, num_decode=2, gpus_per_decode=2), is_baseline=True
+    ) == ("pd-4p2d TEP2", 2)
+
+
+def test_pareto_series_groups_by_type_sorts_by_concurrency():
+    """_pareto_series must group runs by topology_label, sort each series by concurrency, and yield
+    (x=output_tput_per_user, y=output_tput_per_gpu, concurrency, ttft_p50) tuples. Runs missing x or y
+    are dropped."""
+    from srtctl.analysis.bench_report import _pareto_series
+
+    def pt(job, topo, conc, per_user, out_tput, gpus, ttft):
+        r = _make_run(job, topo, is_baseline=False, req_s=1.0, itl_p50=15.0)
+        r.concurrency = conc
+        r.output_tput_per_user = per_user
+        r.output_tput = out_tput  # output_tput_per_gpu = out_tput / active_gpus
+        r.active_gpus = gpus
+        r.ttft_p50 = ttft
+        return r
+
+    runs = [
+        # agg: out of concurrency order on purpose (c64 before c48) -> must sort to (c48, c64)
+        pt("a64", "agg-6xTEP2", 64, 40.0, 1200.0, 12, 2000.0),  # y = 100.0
+        pt("a48", "agg-6xTEP2", 48, 50.0, 600.0, 12, 1000.0),  # y = 50.0
+        pt("c48", "cd-5d1p TEP2", 48, 55.0, 720.0, 12, 900.0),  # y = 60.0
+        pt("c64", "cd-5d1p TEP2", 64, 45.0, 1080.0, 12, 1500.0),  # y = 90.0
+    ]
+    series = _pareto_series(runs)
+    assert set(series) == {"agg-6xTEP2", "cd-5d1p TEP2"}
+    # sorted by concurrency; tuple = (x=per_user, y=out/gpu, conc, ttft)
+    assert series["agg-6xTEP2"] == [(50.0, 50.0, 48, 1000.0), (40.0, 100.0, 64, 2000.0)]
+    assert series["cd-5d1p TEP2"] == [(55.0, 60.0, 48, 900.0), (45.0, 90.0, 64, 1500.0)]
+
+    # a run missing x (per_user None) or y (active_gpus 0 -> per-gpu None) is dropped
+    drop_x = pt("dx", "pd-3p3d TEP2", 48, None, 600.0, 12, 900.0)
+    drop_x.output_tput_per_user = None
+    drop_y = pt("dy", "pd-3p3d TEP2", 64, 50.0, 600.0, 0, 900.0)  # active_gpus=0 -> per-gpu None
+    series2 = _pareto_series([drop_x, drop_y])
+    assert "pd-3p3d TEP2" not in series2
+
+
+def test_render_pareto_png_writes_nonempty_png(tmp_path):
+    """render_pareto_png writes a non-empty PNG for >=2 serving modes x >=2 concurrencies."""
+    from srtctl.analysis.bench_report import render_pareto_png
+
+    def pt(job, topo, conc, per_user, out_tput, ttft):
+        r = _make_run(job, topo, is_baseline=False, req_s=1.0, itl_p50=15.0)
+        r.concurrency = conc
+        r.output_tput_per_user = per_user
+        r.output_tput = out_tput  # active_gpus=12 from the factory
+        r.ttft_p50 = ttft
+        return r
+
+    runs = [
+        pt("a48", "agg-6xTEP2", 48, 50.0, 600.0, 1000.0),
+        pt("a64", "agg-6xTEP2", 64, 40.0, 1200.0, 2000.0),
+        pt("c48", "cd-5d1p TEP2", 48, 55.0, 720.0, 900.0),
+        pt("c64", "cd-5d1p TEP2", 64, 45.0, 1080.0, 1500.0),
+    ]
+    out = tmp_path / "report_pareto.png"
+    ok = render_pareto_png(runs, out, "Pareto smoke")
+    assert ok is True
+    assert out.is_file()
+    data = out.read_bytes()
+    assert len(data) > 0
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"  # PNG magic
+
+
 def test_parse_cd_snapshot_absent_is_na():
     lev = parse_cd_snapshot(None)
     assert isinstance(lev, CdLeverage)
@@ -339,6 +461,17 @@ threshold_sweep:
     - { job_id: 2187937 }
     - { job_id: 2189847 }
     - { job_id: 2189850 }
+pd_disagg:
+  note: "pd note text"
+  runs:
+    - { job_id: 2190163, label: "3p3d" }
+    - { job_id: 2190164, label: "2p4d" }
+pareto:
+  note: "pareto note text"
+  runs:
+    - { job_id: 2187965 }
+    - { job_id: 2188128 }
+    - { job_id: 2190163 }
 """
 
 
@@ -364,6 +497,39 @@ def test_parse_manifest(tmp_path):
     # threshold-sweep axis parsed separately (ordered job ids + note); may overlap runs
     assert m.sweep_job_ids == ["2187937", "2189847", "2189850"]
     assert m.sweep_note == "sweep note text"
+    # trad-P/D serving mode parsed separately (ordered ManifestRuns w/ explicit labels + note)
+    assert [(r.job_id, r.label) for r in m.pd_disagg_runs] == [("2190163", "3p3d"), ("2190164", "2p4d")]
+    assert m.pd_disagg_note == "pd note text"
+    # pareto axis parsed separately (ordered job ids + note); may overlap runs
+    assert m.pareto_job_ids == ["2187965", "2188128", "2190163"]
+    assert m.pareto_note == "pareto note text"
+
+
+def test_render_pd_disagg_valid_and_invalid_runs():
+    from srtctl.analysis.bench_report import ManifestRun, render_pd_disagg
+
+    good = _make_run("2190163", "agg-0xTEP2", is_baseline=False, req_s=1.783, itl_p50=16.4)
+    good.kv = KvMetrics(block_size=1, prefix_hits=3561000)  # kv_reused_blocks=3561000 => consolidator engaged
+    bad = _make_run("2190162", "agg-0xTEP2", is_baseline=False, req_s=0.0, itl_p50=0.0)
+    bad.request_count = 4188
+    bad.error_count = 4188  # all requests errored => INVALID
+    bad.runtime_error = "Not Found×4188"
+    paired = [
+        (ManifestRun("2190162", "4p2d", "cd", False, ""), bad),
+        (ManifestRun("2190163", "3p3d", "cd", False, ""), good),
+    ]
+    md = render_pd_disagg(paired, note="pd note")
+    assert "## 8. Traditional P/D disaggregation" in md
+    assert "small prefixes" not in md  # (sanity: not the sweep thesis)
+    assert "3rd serving mode" in md  # the pd thesis
+    assert "pd note" in md
+    # the 4p2d invalid run is shown but flagged, not silently dropped
+    assert "4p2d" in md and "INVALID" in md and "Not Found" in md
+    # the valid 3p3d is named best (only valid run); kv_reused proves consolidator engaged
+    assert "Best valid trad-P/D @ c48: 3p3d" in md
+    assert "3561000" in md
+    # invalid run sinks below the valid one (ordered by req/s desc)
+    assert md.index("| 3p3d |") < md.index("| 4p2d |")
 
 
 def test_render_threshold_sweep_table_and_thesis():

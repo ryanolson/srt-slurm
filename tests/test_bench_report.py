@@ -229,6 +229,65 @@ def test_parse_cd_snapshot_aggregates(tmp_path):
     assert abs(lev.remote_fraction - 15 / 18) < 1e-9
 
 
+def test_parse_cd_snapshot_token_load_and_breaker_downgrades(tmp_path):
+    """Token-load split (Q3 local / Q4 remote) + the breaker-downgrade wrinkle: a
+    `remote_downgraded_breaker_hot` decision is a policy-Remote request that computed LOCALLY,
+    so it must land in `downgrades` (NOT `remote_decisions`) and its tokens in `local_prefill_tokens`.
+    The live snapshot schema for declines is `remote_prefill_declined`."""
+    snap = tmp_path / "kvbm_metrics_snapshot.json"
+    snap.write_text(
+        json.dumps(
+            {
+                "hub_fanout": {
+                    "instances": {
+                        "decode": {
+                            "snapshot": {
+                                "cd": {
+                                    "prefill_decisions": {
+                                        "local": 100,
+                                        "remote": 60,
+                                        "remote_downgraded_breaker_hot": 40,
+                                    },
+                                    "remote_prefill_declined": {"breaker_hot": 40},
+                                    "local_prefill_tokens_total": 800_000,
+                                    "remote_prefill_tokens_total": 1_200_000,
+                                }
+                            }
+                        },
+                        "prefill": {
+                            "snapshot": {
+                                "cd": {
+                                    "prefill_decisions": {},
+                                    "prefill_computed_tokens_total": 1_200_000,
+                                    "prefill_pulled_tokens_total": 9_000_000,
+                                    "prefill_local_hit_tokens_total": 2_000_000,
+                                }
+                            }
+                        },
+                    }
+                },
+            }
+        )
+    )
+    lev = parse_cd_snapshot(snap)
+    # local_decisions counts by FINAL placement: policy-Local (100) + breaker-HOT downgrade (40)
+    # = 140, so it pairs with local_prefill_tokens for a correct per-request average.
+    assert lev.local_decisions == 140
+    assert lev.remote_decisions == 60  # TRUE remote only — breaker-HOT computed locally
+    assert lev.downgrades == {"remote_downgraded_breaker_hot": 40}  # diagnostic sub-count of local
+    assert lev.declined_by_reason == {"breaker_hot": 40}
+    assert lev.local_prefill_tokens == 800_000
+    assert lev.remote_prefill_tokens == 1_200_000
+    assert lev.prefill_computed_tokens == 1_200_000  # Q6 ≡ Q4
+    # token-load remote share = 1.2M / 2.0M = 0.6, vs decision share 60/200 = 0.3
+    assert abs(lev.remote_compute_fraction - 0.6) < 1e-9
+    assert abs(lev.remote_fraction - 60 / 200) < 1e-9
+    # prefill-side: pulled window, the cached slice (Q7), and the derived supplement
+    assert lev.prefill_pulled_tokens == 9_000_000
+    assert lev.prefill_local_hit_tokens == 2_000_000
+    assert lev.prefill_pull_supplement == 7_000_000  # pulled − local-hit
+
+
 def test_parse_cd_snapshot_decode_workers_only_is_not_present(tmp_path):
     # An aggregated run produces a snapshot with ONLY per-worker metrics (no hub,
     # no CD instances). It must NOT count as CD content => section 4 stays N/A.
@@ -274,6 +333,12 @@ runs:
   - { job_id: 2187965, label: "agg 6xTEP2 (KV-routed)",   kind: baseline,           tpcb: false, note: "primary baseline" }
   - { job_id: 2187812, label: "agg 6xTEP2 (round-robin)", kind: baseline_reference, tpcb: false, note: "reference only" }
   - { job_id: 2187937, label: "CD 5d+1p (+TPCB)",         kind: cd,                 tpcb: true,  note: "TPCB ON" }
+threshold_sweep:
+  note: "sweep note text"
+  runs:
+    - { job_id: 2187937 }
+    - { job_id: 2189847 }
+    - { job_id: 2189850 }
 """
 
 
@@ -296,6 +361,41 @@ def test_parse_manifest(tmp_path):
     assert m.runs[2].kind == "cd" and m.runs[2].is_cd and m.runs[2].tpcb is True
     # baseline selection is by kind, not by order
     assert m.baseline_run().job_id == "2187965"
+    # threshold-sweep axis parsed separately (ordered job ids + note); may overlap runs
+    assert m.sweep_job_ids == ["2187937", "2189847", "2189850"]
+    assert m.sweep_note == "sweep note text"
+
+
+def test_render_threshold_sweep_table_and_thesis():
+    from srtctl.analysis.bench_report import render_threshold_sweep
+
+    def sweep_run(job, thr, req, brk_hot):
+        r = _make_run(job, "cd-5d1p TEP2", is_baseline=False, req_s=req, itl_p50=15.0)
+        r.condp_policy = thr
+        r.cd = CdLeverage(
+            instances=2,
+            remote_decisions=1000 - thr // 4,  # falls as threshold rises
+            local_prefill_tokens=8_000_000,
+            remote_prefill_tokens=10_000_000,
+            prefill_pulled_tokens=60_000_000,
+            prefill_local_hit_tokens=36_000_000,  # 60% over-pull
+            downgrades={"remote_downgraded_breaker_hot": brk_hot},
+        )
+        return r
+
+    runs = [sweep_run("J1024", 1024, 1.942, 438), sweep_run("J8192", 8192, 1.986, 110)]
+    md = render_threshold_sweep(runs, note="my sweep note")
+    assert "## 7. Conditional-threshold sweep" in md
+    assert "small prefills don't matter, the large ones do" in md  # the thesis
+    assert "my sweep note" in md
+    assert "@ concurrency 48" in md
+    # rows ordered by threshold; req/s delta vs the lowest threshold (1024 = +0.0%)
+    assert "| 1024 | J1024 | 1.942 (+0.0%)" in md
+    assert "| 8192 | J8192 | 1.986 (+2.3%)" in md
+    # over-pull% derived = local_hit / pulled = 36M/60M = 0.6
+    assert "0.600" in md or "60%" in md
+    # breaker-HOT count surfaced
+    assert "438" in md and "110" in md
 
 
 def _make_run(job_id: str, label_topo: str, *, is_baseline: bool, req_s: float, itl_p50: float) -> RunReport:

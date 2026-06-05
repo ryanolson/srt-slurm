@@ -42,7 +42,7 @@ dynamo:
 
 model:
   path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
-  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260606.sqsh"  # FP8 + B-GNMT + circuit breaker
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260607.sqsh"  # FP8 + B-GNMT + breaker + CD token-load metrics (Q7 prefill local-hit)
   precision: "fp4"
 
 extra_mount:

@@ -20,7 +20,7 @@
 # circuit breaker). CD-leverage + breaker tier transitions captured by the post-benchmark
 # hub-metrics snapshot hook (Prometheus, so KVBM_CONTROL_METRICS=true suffices, RUST_LOG=error).
 
-name: "kvbm-cdg-5d1p-breaker-c64"
+name: "kvbm-cdg-5d1p-breaker-t4096-c64"
 
 identity:
   model:
@@ -92,7 +92,7 @@ backend:
   kvbm_hub:
     hub_binary: "/opt/kvbm/bin/kvbm_hub"
     block_layout: operational           # symmetric TP (decode TEP2 == prefill TEP2)
-    min_remote_prefill_tokens: 1024     # Conditional Threshold = 1024 (the HEAVY config)
+    min_remote_prefill_tokens: 4096     # Conditional Threshold = 4096 (threshold sweep)
     # CIRCUIT BREAKER (router-sourced 3-tier; replaces the static B-GNMT max_inflight budget):
     cd_breaker_enabled: true
     cd_breaker_warm_high: 0.5           # trip CALM->WARM when prefill free-capacity-fraction < 0.5

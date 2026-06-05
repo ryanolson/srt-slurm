@@ -382,11 +382,17 @@ class CdLeverage:
     # can produce a snapshot (decode_workers only, no hub) — that is NOT CD content,
     # so section 4 stays N/A for it (design: "Agg: N/A").
     snapshot_found: bool = False
-    local_decisions: int = 0
-    remote_decisions: int = 0
-    remote_prefill_tokens: int = 0
-    prefill_computed_tokens: int = 0
+    local_decisions: int = 0  # Q1: policy-Local DECISIONS (request count, NOT tokens)
+    remote_decisions: int = 0  # Q2: TRUE-remote DECISIONS (label=="remote"); excludes downgrades
+    local_prefill_tokens: int = 0  # Q3: tokens the decode computes locally, net of G1+G2 prefix match
+    remote_prefill_tokens: int = 0  # Q4: tokens the remote prefill computes (remote_blocks*bs)
+    prefill_computed_tokens: int = 0  # Q6: prefill-worker forward-pass tokens; ≡ Q4 by construction
+    prefill_pulled_tokens: int = 0  # prefix window the prefill worker pulled from decode (over-pull)
+    prefill_local_hit_tokens: int = 0  # Q7: of the pulled prefix, what prefill already had cached (PNCT opp.)
     declined_by_reason: dict[str, int] = field(default_factory=dict)
+    # Policy-Remote decisions that did NOT disaggregate (computed LOCALLY instead): breaker-HOT
+    # coarse downgrade, B-GNMT overload downgrade, zero-block, budget-rejected. Their local
+    # compute is already folded into local_prefill_tokens (Q3).
     downgrades: dict[str, int] = field(default_factory=dict)
     instances: int = 0
     raw_error: str | None = None
@@ -398,10 +404,31 @@ class CdLeverage:
 
     @property
     def remote_fraction(self) -> float | None:
+        """DECISION-based remote share by FINAL placement: true-remote requests / all CD-policy
+        requests. local_decisions already folds in the downgrade-to-local labels, so the
+        denominator covers every decision exactly once (downgrades are a sub-count of local)."""
         total = self.local_decisions + self.remote_decisions
         if total <= 0:
             return None
         return self.remote_decisions / total
+
+    @property
+    def remote_compute_fraction(self) -> float | None:
+        """TOKEN-LOAD remote share = remote tokens / (local + remote tokens). The load-bearing
+        leverage number: where the prefill FLOPs actually went, net of the G1+G2 prefix match.
+        Differs from remote_fraction because requests vary wildly in prompt length and because
+        breaker/overload downgrades move would-be-remote requests into the local token bucket."""
+        total = self.local_prefill_tokens + self.remote_prefill_tokens
+        if total <= 0:
+            return None
+        return self.remote_prefill_tokens / total
+
+    @property
+    def prefill_pull_supplement(self) -> int:
+        """Genuine tokens the prefill worker must pull from decode after crediting its own
+        cache = pulled − local-hit. Today the worker over-pulls the full window, so this is
+        the PNCT savings opportunity, not yet realized."""
+        return max(0, self.prefill_pulled_tokens - self.prefill_local_hit_tokens)
 
 
 def parse_cd_snapshot(snapshot_path: Path | None) -> CdLeverage:
@@ -447,23 +474,39 @@ def parse_cd_snapshot(snapshot_path: Path | None) -> CdLeverage:
                     iv = int(v)
                 except (TypeError, ValueError):
                     continue
-                if k.startswith("local"):
+                # Classify each decision by where prefill ACTUALLY ran, so local_decisions
+                # pairs with local_prefill_tokens (and remote with remote_prefill_tokens) — the
+                # decode connector records local tokens on EVERY final-local path. Mapping mirrors
+                # the record sites in decode_leader.rs:
+                #   final-LOCAL : "local", "*downgraded*" (breaker-hot/warm, overload, zero-block),
+                #                 "*rejected*" (budget) — all call record_local_prefill_tokens
+                #   final-REMOTE: "remote", "*admitted*" (warm admit→remote, P3)
+                # Non-{local,remote} labels are ALSO kept in `downgrades` as a diagnostic breakdown
+                # (a sub-count of local_decisions), so the table can show why local got the load.
+                if k == "local" or "downgraded" in k or "rejected" in k:
                     lev.local_decisions += iv
-                elif k.startswith("remote"):
+                elif k == "remote" or "admitted" in k:
                     lev.remote_decisions += iv
+                if k not in ("local", "remote"):
+                    lev.downgrades[k] = lev.downgrades.get(k, 0) + iv
         for k, dst in (
+            ("local_prefill_tokens_total", "local_prefill_tokens"),
             ("remote_prefill_tokens_total", "remote_prefill_tokens"),
             ("prefill_computed_tokens_total", "prefill_computed_tokens"),
+            ("prefill_pulled_tokens_total", "prefill_pulled_tokens"),
+            ("prefill_local_hit_tokens_total", "prefill_local_hit_tokens"),
         ):
             v = cd.get(k)
             if v is not None:
                 with contextlib.suppress(TypeError, ValueError):
                     setattr(lev, dst, getattr(lev, dst) + int(v))
-        declined = cd.get("declined", {}) or {}
+        # Declines: the live schema is "remote_prefill_declined" (older/test snapshots: "declined").
+        declined = cd.get("remote_prefill_declined", {}) or cd.get("declined", {}) or {}
         if isinstance(declined, dict):
             for k, v in declined.items():
                 with contextlib.suppress(TypeError, ValueError):
                     lev.declined_by_reason[k] = lev.declined_by_reason.get(k, 0) + int(v)
+        # A dedicated downgrades/breaker_downgrades map, if a future snapshot emits one, folds in too.
         downgrades = cd.get("downgrades", {}) or cd.get("breaker_downgrades", {}) or {}
         if isinstance(downgrades, dict):
             for k, v in downgrades.items():
@@ -786,6 +829,11 @@ class Manifest:
     generated_note: str
     changelog: list[ManifestChangelogEntry]
     runs: list[ManifestRun]
+    # Optional parallel axis: a conditional-threshold sweep over ONE topology (5d1p),
+    # rendered in its own section (NOT mixed into the topology comparison). Ordered job ids
+    # (the threshold is read from each run's condp_policy); may overlap `runs` (the anchor).
+    sweep_job_ids: list[str] = field(default_factory=list)
+    sweep_note: str = ""
     source_path: Path | None = None
 
     def baseline_run(self) -> ManifestRun | None:
@@ -837,6 +885,24 @@ def parse_manifest(path: Path) -> Manifest:
             )
         )
 
+    # Optional threshold sweep: `threshold_sweep: {note?, runs: [{job_id}, ...]}`
+    # (also tolerates a bare list of {job_id}). Ordered; threshold comes from condp_policy.
+    sweep_job_ids: list[str] = []
+    sweep_note = ""
+    sweep_block = data.get("threshold_sweep")
+    if isinstance(sweep_block, dict):
+        sweep_note = str(sweep_block.get("note", ""))
+        sweep_entries = sweep_block.get("runs") or []
+    elif isinstance(sweep_block, list):
+        sweep_entries = sweep_block
+    else:
+        sweep_entries = []
+    for entry in sweep_entries:
+        if isinstance(entry, dict) and entry.get("job_id") is not None:
+            sweep_job_ids.append(str(entry.get("job_id")))
+        elif isinstance(entry, (str, int)):
+            sweep_job_ids.append(str(entry))
+
     return Manifest(
         title=str(data.get("title", "KVBM benchmark report")),
         dataset=(str(data["dataset"]) if data.get("dataset") is not None else None),
@@ -844,6 +910,8 @@ def parse_manifest(path: Path) -> Manifest:
         generated_note=str(data.get("generated_note", "")),
         changelog=changelog,
         runs=runs,
+        sweep_job_ids=sweep_job_ids,
+        sweep_note=sweep_note,
         source_path=path,
     )
 
@@ -892,6 +960,91 @@ def delta_pct(cur: float | None, base: float | None) -> str:
     d = (cur - base) / base * 100.0
     sign = "+" if d >= 0 else ""
     return f"{sign}{d:.1f}%"
+
+
+# ---------------------------------------------------------------------------
+# Threshold sweep (parallel axis — its own section, not the topology comparison)
+# ---------------------------------------------------------------------------
+
+# The interpretive thesis of the sweep, kept in one place so the md + HTML agree.
+_SWEEP_THESIS = (
+    "**Conclusion: in this workload the conditional threshold is a weak throughput lever but a "
+    "useful TTFT / prefill-pressure knob — and it tells us the small prefills don't matter, the "
+    "large ones do.** Raising `min_remote_prefill_tokens` from 1024 to 8192 cuts remote *decisions* "
+    "~3x (fewer requests clear the bar to disaggregate), yet the token-compute remote share stays "
+    "flat (~56%): the requests we stop disaggregating carry almost no prefill FLOPs, so the prefill "
+    "aside does ~the same total work either way. In other words the small-remainder prefills (uncached "
+    "remainder in [1024, 8192)) are numerous but FLOP-negligible; the prefill load is dominated by the "
+    "few large prefills (remainder > 8192), which disaggregate at every threshold. Net effect of a "
+    "higher threshold: throughput ~flat (within run-noise — the server is not saturated at these "
+    "concurrencies), TTFT p50 modestly better (~8-15%, less prefill-aside queueing), and the circuit "
+    "breaker fires far less (it stops policing the cheap small disaggregations). The over-pull stays "
+    "~50-64% across the whole range, so the PNCT opportunity is threshold-independent."
+)
+
+
+def _sweep_by_concurrency(sweep_runs: list[RunReport]) -> dict[int, list[RunReport]]:
+    """Group sweep runs by declared concurrency, each list sorted by threshold (condp_policy)."""
+    by_conc: dict[int, list[RunReport]] = {}
+    for r in sweep_runs:
+        by_conc.setdefault(r.concurrency or -1, []).append(r)
+    for runs in by_conc.values():
+        runs.sort(key=lambda r: (r.condp_policy if r.condp_policy is not None else 0))
+    return by_conc
+
+
+def _sweep_overpull(cd: CdLeverage) -> float | None:
+    return cd.prefill_local_hit_tokens / cd.prefill_pulled_tokens if cd.prefill_pulled_tokens else None
+
+
+def _sweep_breaker_hot(cd: CdLeverage) -> int:
+    return sum(v for k, v in cd.downgrades.items() if "breaker_hot" in k)
+
+
+def _pct0(frac: float | None) -> str:
+    """Format a [0,1] fraction as a whole-percent string (N/A when None)."""
+    return f"{frac * 100:.0f}%" if frac is not None else "N/A"
+
+
+def render_threshold_sweep(sweep_runs: list[RunReport], note: str = "") -> str:
+    """Section 7: the conditional-threshold sweep, one table per concurrency.
+
+    Columns are the per-threshold rows (req/s with delta vs the lowest threshold, TTFT/ITL
+    p50+p90, and the CD-leverage that actually moves: remote decisions, token-compute remote%,
+    prefill over-pull%, breaker-HOT count)."""
+    lines: list[str] = []
+    lines.append("## 7. Conditional-threshold sweep")
+    lines.append("")
+    lines.append(_SWEEP_THESIS)
+    lines.append("")
+    if note:
+        lines.append(f"> {note}")
+        lines.append("")
+    by_conc = _sweep_by_concurrency(sweep_runs)
+    for conc in sorted(by_conc):
+        runs = by_conc[conc]
+        topo = runs[0].topology_label if runs else "?"
+        lines.append(f"### {topo} @ concurrency {conc}")
+        lines.append("")
+        lines.append(
+            "| threshold | job | req/s (Δ vs min) | TTFT p50 | TTFT p90 | ITL p50 | ITL p90 | "
+            "remote dec | token rem% | over-pull% | breaker HOT |"
+        )
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        base_req = next((r.request_throughput for r in runs if r.request_throughput), None)
+        for r in runs:
+            cd = r.cd
+            req = r.request_throughput
+            dpart = ""
+            if req is not None and base_req:
+                dpart = f" ({(req - base_req) / base_req * 100:+.1f}%)"
+            lines.append(
+                f"| {r.condp_policy} | {r.job_id} | {fmt(req, 3)}{dpart} | {fmt(r.ttft_p50, 0)} | "
+                f"{fmt(r.ttft_p90, 0)} | {fmt(r.itl_p50, 1)} | {fmt(r.itl_p90, 1)} | {cd.remote_decisions} | "
+                f"{_pct0(cd.remote_compute_fraction)} | {_pct0(_sweep_overpull(cd))} | {_sweep_breaker_hot(cd)} |"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1121,6 +1274,22 @@ def render_markdown(
     # ---- 4. CD-internal leverage ----
     lines.append("## 4. CD-internal leverage")
     lines.append("")
+    lines.append(
+        "> **Decisions are request COUNTS; token columns are the prefill COMPUTE load — counted by "
+        "FINAL placement.** `local dec`/`remote dec` count *requests* by where prefill actually ran: "
+        "`local dec` includes policy-Local AND every policy-Remote request the breaker/overload/"
+        "zero-block/budget path downgraded back to local (those are itemized in `downgrades` as a "
+        "sub-count of `local dec`); `remote dec` = TRUE disaggregation only. So `local tok`/`local "
+        "dec` and `remote tok`/`remote dec` are each correct per-request averages. `local tok` (Q3) "
+        "and `remote tok` (Q4) are the tokens actually prefilled on the decode workers vs the "
+        "prefill aside, each **net of the G1+G2 prefix match** (`remote tok` ≡ the prefill-worker "
+        "forward-pass tokens by construction). `remote tok%` = remote / (local+remote) tokens — the "
+        "load-bearing leverage number (where the prefill FLOPs went), which differs from the "
+        "decision share because prompts vary wildly in length and downgrades shift would-be-remote "
+        "load into `local tok`. NOTE: the decode-side match credits G1+G2 only — a remote/G3-tier "
+        "prefix match is not separately credited."
+    )
+    lines.append("")
     any_cd = any(run.cd.present for run in runs)
     found_but_empty = [run for run in runs if run.cd.snapshot_found and not run.cd.present]
     if not any_cd:
@@ -1145,21 +1314,54 @@ def render_markdown(
         )
     else:
         lines.append(
-            "| job | topology | local | remote | remote% | remote prefill tok | prefill computed tok | declined | downgrades |"
+            "| job | topology | local dec | remote dec | local tok | remote tok | remote tok% | downgrades |"
         )
-        lines.append("|---|---|---|---|---|---|---|---|---|")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for run in runs:
             cd = run.cd
             if not cd.present:
                 why = "no CD content" if cd.snapshot_found else "no snapshot"
-                lines.append(f"| {run.job_id} | {run.topology_label} | _N/A ({why})_ | | | | | | |")
+                lines.append(f"| {run.job_id} | {run.topology_label} | _N/A ({why})_ | | | | | |")
                 continue
-            declined = ", ".join(f"{k}={v}" for k, v in sorted(cd.declined_by_reason.items())) or "-"
             downgr = ", ".join(f"{k}={v}" for k, v in sorted(cd.downgrades.items())) or "-"
             lines.append(
                 f"| {run.job_id} | {run.topology_label} | {cd.local_decisions} | {cd.remote_decisions} | "
-                f"{fmt(cd.remote_fraction, 3)} | {cd.remote_prefill_tokens} | "
-                f"{cd.prefill_computed_tokens} | {declined} | {downgr} |"
+                f"{cd.local_prefill_tokens} | {cd.remote_prefill_tokens} | "
+                f"{fmt(cd.remote_compute_fraction, 3)} | {downgr} |"
+            )
+        lines.append("")
+
+        # ---- 4b. Prefill-side prefix acquisition ----
+        lines.append("### 4b. Prefill-side prefix acquisition (the prefill aside)")
+        lines.append("")
+        lines.append(
+            "> For each disaggregated request the prefill worker acquires the prompt prefix as "
+            "`pulled` (RDMA-pulled from decode) and forward-passes only the net-new remainder "
+            "(`computed` = the prefill PRESSURE gauge, ≡ decode `remote tok`). Today the worker "
+            "OVER-PULLS the full `[0, DNPT)` window; `local hit` is the slice it already had cached "
+            "(its own vLLM prefix-cache hit), so the genuine `supplement` it would still need after "
+            "the PNCT optimization = `pulled − local hit`. `local hit`/`supplement` need the "
+            "Q7-instrumented binary (kvbm-prod-260607+); older runs report `local hit`=0 ⇒ "
+            "`supplement`=`pulled` (unmeasured, not truly zero). CAVEAT: `local hit` is the prefill "
+            "worker's vLLM-G1 prefix-cache hit only — a LOWER BOUND on the true opportunity, which "
+            "also includes the prefill worker's own G2/G3 tiers (not yet surfaced)."
+        )
+        lines.append("")
+        lines.append(
+            "| job | topology | computed (forward) | pulled (from decode) | local hit (cached) | supplement (pull−hit) | pull:compute |"
+        )
+        lines.append("|---|---|---|---|---|---|---|")
+        for run in runs:
+            cd = run.cd
+            if not cd.present:
+                why = "no CD content" if cd.snapshot_found else "no snapshot"
+                lines.append(f"| {run.job_id} | {run.topology_label} | _N/A ({why})_ | | | | |")
+                continue
+            ratio = cd.prefill_pulled_tokens / cd.prefill_computed_tokens if cd.prefill_computed_tokens else None
+            lines.append(
+                f"| {run.job_id} | {run.topology_label} | {cd.prefill_computed_tokens} | "
+                f"{cd.prefill_pulled_tokens} | {cd.prefill_local_hit_tokens} | "
+                f"{cd.prefill_pull_supplement} | {fmt(ratio, 2)} |"
             )
     lines.append("")
 
@@ -1309,6 +1511,14 @@ def _esc(s: Any) -> str:
     return html.escape(str(s), quote=True)
 
 
+def _md_inline_to_html(s: str) -> str:
+    """Minimal inline-markdown → HTML for report prose: **bold** + `code`, HTML-escaped first."""
+    out = _esc(s)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"`(.+?)`", r"<code>\1</code>", out)
+    return out
+
+
 def _col_class(mr: ManifestRun) -> str:
     if mr.is_baseline:
         return "col-baseline"
@@ -1322,6 +1532,7 @@ def render_html(
     paired: list[tuple[ManifestRun, RunReport]],
     ttft_sla_ms: float,
     itl_sla_ms: float,
+    sweep_runs: list[RunReport] | None = None,
 ) -> str:
     """Render a SELF-CONTAINED HTML report from a curated manifest.
 
@@ -1456,6 +1667,38 @@ def render_html(
         "metric.</div>"
     )
 
+    # ---- Threshold sweep (parallel axis) ----
+    if sweep_runs:
+        out.append("<h2>Conditional-threshold sweep</h2>")
+        out.append(f"<p class='note'>{_md_inline_to_html(_SWEEP_THESIS)}</p>")
+        if manifest.sweep_note:
+            out.append(f"<p class='caveat'>{_esc(manifest.sweep_note)}</p>")
+        for conc in sorted(_sweep_by_concurrency(sweep_runs)):
+            sruns = _sweep_by_concurrency(sweep_runs)[conc]
+            topo = sruns[0].topology_label if sruns else "?"
+            out.append(f"<h3>{_esc(topo)} @ concurrency {conc}</h3>")
+            out.append("<table><thead><tr>")
+            for h in (
+                "threshold", "job", "req/s", "TTFT p50", "TTFT p90", "ITL p50",
+                "ITL p90", "remote dec", "token rem%", "over-pull%", "breaker HOT",
+            ):
+                out.append(f"<th>{_esc(h)}</th>")
+            out.append("</tr></thead><tbody>")
+            base_req = next((r.request_throughput for r in sruns if r.request_throughput), None)
+            for r in sruns:
+                cd = r.cd
+                req = r.request_throughput
+                reqcell = fmt(req, 3)
+                if req is not None and base_req:
+                    reqcell += f" ({(req - base_req) / base_req * 100:+.1f}%)"
+                cells = [
+                    str(r.condp_policy), r.job_id, reqcell, fmt(r.ttft_p50, 0), fmt(r.ttft_p90, 0),
+                    fmt(r.itl_p50, 1), fmt(r.itl_p90, 1), str(cd.remote_decisions),
+                    _pct0(cd.remote_compute_fraction), _pct0(_sweep_overpull(cd)), str(_sweep_breaker_hot(cd)),
+                ]
+                out.append("<tr>" + "".join(f"<td>{_esc(c)}</td>" for c in cells) + "</tr>")
+            out.append("</tbody></table>")
+
     # ---- Per-run provenance footer ----
     out.append("<h2>Per-run provenance</h2>")
     out.append("<table class='prov'><thead><tr>")
@@ -1563,8 +1806,13 @@ def csv_rows(runs: list[RunReport]) -> tuple[list[str], list[dict[str, Any]]]:
         "cd_local_decisions",
         "cd_remote_decisions",
         "cd_remote_fraction",
+        "cd_local_prefill_tokens",
         "cd_remote_prefill_tokens",
+        "cd_remote_compute_fraction",
         "cd_prefill_computed_tokens",
+        "cd_prefill_pulled_tokens",
+        "cd_prefill_local_hit_tokens",
+        "cd_prefill_pull_supplement",
         "cd_instances",
     ]
     rows: list[dict[str, Any]] = []
@@ -1640,8 +1888,13 @@ def csv_rows(runs: list[RunReport]) -> tuple[list[str], list[dict[str, Any]]]:
                 "cd_local_decisions": cd.local_decisions,
                 "cd_remote_decisions": cd.remote_decisions,
                 "cd_remote_fraction": cd.remote_fraction,
+                "cd_local_prefill_tokens": cd.local_prefill_tokens,
                 "cd_remote_prefill_tokens": cd.remote_prefill_tokens,
+                "cd_remote_compute_fraction": cd.remote_compute_fraction,
                 "cd_prefill_computed_tokens": cd.prefill_computed_tokens,
+                "cd_prefill_pulled_tokens": cd.prefill_pulled_tokens,
+                "cd_prefill_local_hit_tokens": cd.prefill_local_hit_tokens,
+                "cd_prefill_pull_supplement": cd.prefill_pull_supplement,
                 "cd_instances": cd.instances,
             }
         )
@@ -1709,13 +1962,26 @@ def run_manifest_mode(args: argparse.Namespace) -> int:
         logger.warning("Manifest declares no kind=baseline run — deltas will be omitted in the HTML.")
 
     runs = [rr for _, rr in paired]
-    html_doc = render_html(manifest, paired, args.ttft_sla_ms, args.itl_sla_ms)
+
+    # Threshold sweep (parallel axis): build RunReports for the sweep job ids, reusing the
+    # already-built main runs by job id (the anchor overlaps) so each dir is parsed once.
+    sweep_runs: list[RunReport] = []
+    if manifest.sweep_job_ids:
+        by_id = {rr.job_id: rr for rr in runs}
+        for jid in manifest.sweep_job_ids:
+            rr = by_id.get(jid) or _build_run(jid, args.ttft_sla_ms, args.itl_sla_ms)
+            if rr is not None:
+                sweep_runs.append(rr)
+
+    html_doc = render_html(manifest, paired, args.ttft_sla_ms, args.itl_sla_ms, sweep_runs)
 
     # md + csv reuse the existing renderers (grouping + explicit baseline by kind).
     base_mr = manifest.baseline_run()
     explicit_baseline = base_mr.job_id if base_mr else None
     groups = group_runs(runs)
     md = render_markdown(runs, groups, explicit_baseline, args.ttft_sla_ms, args.itl_sla_ms)
+    if sweep_runs:
+        md = md.rstrip() + "\n\n" + render_threshold_sweep(sweep_runs, manifest.sweep_note)
 
     out_dir = Path(args.out_dir).resolve() if args.out_dir else manifest_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1731,6 +1997,11 @@ def run_manifest_mode(args: argparse.Namespace) -> int:
         csv_path = out_dir / f"{stem}.csv"
         write_csv(csv_path, runs)
         logger.info("Wrote %s", csv_path)
+        # Sibling CSV for the sweep axis (full schema, every threshold point).
+        if sweep_runs:
+            sweep_csv = out_dir / f"{stem}_threshold_sweep.csv"
+            write_csv(sweep_csv, sweep_runs)
+            logger.info("Wrote %s", sweep_csv)
     return 0
 
 

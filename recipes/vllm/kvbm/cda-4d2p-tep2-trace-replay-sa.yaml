@@ -1,0 +1,119 @@
+# EXPERIMENT cd-A — Conditional Disaggregation, 4 decode + 2 prefill, all TEP=2.
+#
+# KVBM full-dynamo CD plane: dynamo frontend + KV-router -> 4 AGGREGATED decode workers
+# (TEP=2, 2 GPU each, 2 workers/node => 2 nodes) running the kvbm v2 connector
+# (role=decode) against a kvbm_hub, PLUS 2 hub-owned PREFILL ASIDE workers
+# (kvbm.vllm.prefill, TEP=2, one worker per node => 2 nodes). Hub in OPERATIONAL mode
+# (symmetric TP: decode TEP2 == prefill TEP2). Conditional Threshold = 1024 tokens.
+#
+# Topology (ISO-GPU, 1 worker/node): decode 4xTEP2 SPREAD 1/node = 4 nodes; prefill
+# 2xTEP2 1/node = 2 nodes => 6 GB200 nodes total, 12 GPUs used (each worker uses 2 of
+# its node's 4 GPUs; etcd/nats + hub co-located on the head decode node). 1 worker/node
+# keeps decode iso with the prefill aside (also 1/node) — every worker gets a full node.
+# Pairs with cd-B (3d+3p TEP2); both run concurrently. Baselines: agg TEP4x4 (2185318),
+# agg TEP2x6 (2185391). See docs/runs/cd_comparison_experiments.md.
+
+name: "kvbm-cda-4d2p-tep2-trace-replay-sa"
+
+identity:
+  model:
+    repo: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+    revision: "1c4ec35802abf3a20672be7e5c51a098796f71d6"
+  container:
+    image: "nvcr.io/nvidian/dynamo-dev/ryan:kvbm-vllm-dev-260602"
+  frameworks:
+    dynamo: "1.2.0"
+    vllm: "0.21.0"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  time_limit: "01:45:00"
+
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260603b.sqsh"
+  precision: "fp4"
+
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  ENABLE_EXPERT_PARALLEL: "1"
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  KVBM_CONTROL_METRICS: "true"          # CD metrics via hub control-port pull
+  DYN_LOG: "error"
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4
+  # Decode plane: 4 AGGREGATED TEP=2 workers (2 GPU each), SPREAD 1 worker/node => 4 nodes.
+  agg_nodes: 4
+  agg_workers: 4
+  gpus_per_agg: 2
+  spread_workers: true             # 1 worker/node (iso with the prefill aside; full node each)
+  # Hub-owned PREFILL ASIDE: 2 TEP=2 workers, one worker per node => 2 nodes.
+  kvbm_prefill_nodes: 2
+  kvbm_prefill_tp: 2
+
+infra:
+  etcd_nats_dedicated_node: false       # co-locate etcd/nats + hub => 4 nodes total
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: "kv"
+    router-kv-events: true
+    router-min-initial-workers: 4       # = agg_workers (decode only; prefill invisible)
+
+backend:
+  type: vllm
+
+  kvbm_hub:
+    hub_binary: "/opt/kvbm/bin/kvbm_hub"
+    block_layout: operational           # symmetric TP (decode TEP2 == prefill TEP2)
+    min_remote_prefill_tokens: 1024     # Conditional Threshold = 1024 tokens
+    host_cache_gb: 160.0                # PER-RANK => 4 ranks/decode-node * 160 = 640 GiB/node
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+      tensor-parallel-size: 2           # TEP=2
+      enable-expert-parallel: true
+      gpu-memory-utilization: 0.85
+      block-size: 64
+      max-model-len: 262144
+
+benchmark:
+  type: "trace-replay-sa"
+  public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
+  num_dataset_entries: 470           # full with-subagents 256k corpus (470 traces)
+  concurrencies: "48"
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 10
+  aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"
+  aiperf_args:
+    benchmark-duration: 1200
+    benchmark-grace-period: 30
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 120
+    export-http-trace: true

@@ -14,4 +14,4 @@ use_segment_sbatch_directive: true
 use_exclusive_sbatch_directive: false
 
 # Where /configs (NATS/etcd binaries, setup scripts) is mounted from.
-srtctl_root: /lustre/fsw/core_dlfw_ci/ryan/srt-slurm
+srtctl_root: /lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/srt-slurm

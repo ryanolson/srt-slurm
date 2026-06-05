@@ -1,0 +1,208 @@
+# KVBM full-dynamo plane (decode AGG + hub-owned prefill aside + KV-router +
+# conditional-disagg), benchmarked with the **trace-replay-sa** SemiAnalysis
+# agentic-coding trace dataset (a realistic CD load test).
+#
+# This is the agg-kv-router-hub.yaml CD plane with two changes:
+#   1. model -> nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4 (TEP=4). ASSUMPTION
+#      (unverified): the `…_256k` in the dataset name implies long (up to ~256k-token)
+#      traces; this model's native context is 262144 (256k), so it's a safe match.
+#      If the traces are in fact that long, Qwen3-32B (40k) would truncate them — but
+#      confirm what "256k" actually means for this corpus before ruling the 32B out.
+#   2. benchmark -> trace-replay-sa (aiperf --public-dataset, ported from
+#      karen-sy/srt-slurm-nv@d1b6e0d). The SA public-dataset loaders are NOT in
+#      stock aiperf; benchmark.aiperf_package pins the cquil11/aiperf fork that
+#      registers them.
+#
+# OFFLINE/NETWORK PREREQUISITE — RESOLVED 2026-06-03 (re-do on a fresh cluster/cache):
+# This benchmark fetches at RUN TIME, ON THE COMPUTE NODE:
+#   (a) bench.sh `uv pip install git+https://github.com/cquil11/aiperf.git@…`
+#   (b) the SA corpus via aiperf's loader -> datasets.load_dataset(repo, split=train)
+# Status on ptyche/tcpo: (a) compute nodes HAVE github + HF egress (verified by probe)
+# and the shared ~/.cache/uv was warmed with this aiperf ref, so the on-node install
+# works; (b) the SA dataset (semianalysisai/cc-traces-weka-with-subagents-052726-256k,
+# 470 rows) is PRE-CACHED into the shared /hf_cache and verified to load with
+# HF_HUB_OFFLINE=1. So the offline gap is closed and HF_HUB_OFFLINE=1 below is fine.
+# See the trace-replay-sa-offline memory note. Still UNVALIDATED: the actual 235B
+# bringup + a real benchmark run (the tunables below).
+#
+# Decode is AGGREGATED on purpose: `--disaggregation-mode decode` disables the
+# KV-event publisher, which blinds the router.
+#
+# >>> REVIEW BEFORE `srtctl apply` <<<  the topology (resources.*), max-model-len,
+# host_cache_gb, and benchmark.concurrencies are LOAD-TEST TUNABLES — the values
+# below are sensible starting points (235B template from agg-kv-router-hub.yaml +
+# Karen's benchmark block), not a validated configuration. See the validated CD
+# plane + numbers in docs/design (stage2b_results.md, cd_observability_design.md).
+
+name: "kvbm-vllm-agg-kv-hub-trace-replay-sa"
+
+# Reproducibility: exact weights + framework versions. revision = the HF commit
+# SHA of the verified Instruct-2507 NVFP4 download (= the snapshot dir name).
+# srtctl verifies the runtime matches this at job start.
+identity:
+  model:
+    repo: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+    revision: "1c4ec35802abf3a20672be7e5c51a098796f71d6"
+  container:
+    image: "nvcr.io/nvidian/dynamo-dev/ryan:kvbm-vllm-dev-260602"
+  frameworks:
+    dynamo: "1.2.0"        # our locally-built ai_dynamo / ai_dynamo_runtime / kvbm wheels
+    vllm: "0.21.0"         # shipped in the kvbm dev image
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  # 235B real-weight load + warmup + the SA sweep (benchmark-duration 300s/concurrency).
+  # Raise if you add concurrency levels or per-level duration.
+  time_limit: "01:30:00"
+
+# Install the locally-built kvbm + ai_dynamo + ai_dynamo_runtime wheels into the
+# image venv before frontend/decode/prefill start (the dev kvbm image lacks the
+# `dynamo` package + kvbm). Runs IN-container, once per node, from the mounted
+# dynamo repo (target/wheels). PRODUCTION image (baked) => the script verify-no-ops.
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  # hf: prefix => resolved from the HF cache (offline), NOT a local mount. The
+  # Instruct-2507 NVFP4 weights were downloaded + verified into the shared hf_cache
+  # 2026-06-03 (139 GB, 28 shards). NVFP4 weights + FP8 KV cache (modelopt).
+  path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+  # The kvbm dev image (.sqsh). DEV variant: setup_script installs the wheels; the
+  # hub binary runs from /workspace/target/release (mounted below). For a PRODUCTION
+  # image, point this at kvbm-prod-<date>.sqsh (setup_script verify-no-ops).
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm.sqsh"
+  precision: "fp4"                   # 235B-A22B-NVFP4 (Qwen3-32B was bf16)
+
+# Mount the dynamo repo (wheels for setup_script + the kvbm_hub/kvbmctl binaries +
+# start-hub.sh) at /workspace, the workspace root at /models (so /models/harness +
+# /models/image resolve), and the SHARED hf_cache — which lives OUTSIDE the
+# workspace — at its own /hf_cache. List form (not a dict) avoids the
+# show_config_details FormattablePath display bug.
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+# Offline HF cache for every component (frontend resolves the tokenizer; decode +
+# prefill load weights). The prefill aside + decode + frontend all read these.
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  # kvbm v2 connector rejects vllm > 0.19.999 unless bypassed (image ships 0.21.0).
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  # MoE: Qwen3-235B-A22B (qwen3_moe, 128 experts) needs expert parallelism. The
+  # connector/vLLM read this; TEP runs attention TP + MoE EP across the TP ranks.
+  ENABLE_EXPERT_PARALLEL: "1"
+  # NIXL UCX: configuring cache.host auto-enables NIXL/UCX. The image's default
+  # NIXL_PLUGIN_DIR (/opt/dynamo/nixl/plugins, system NIXL) MISMATCHES the libnixl
+  # the connector actually loads (the cu13 WHEEL's, via $ORIGIN RPATH) => "backend
+  # 'UCX' not found". Pin it to the wheel's plugins (probed via /proc/maps on the
+  # 260602 image; ldd-clean). Image-specific — re-probe if the image changes.
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  # CD observability metrics via the HUB PULL — NOT a per-worker /metrics axum.
+  # KVBM_CONTROL_METRICS=true registers each leader's control-plane MetricsModule;
+  # the hub aggregates all leaders at  GET http://<hub>:<CONTROL_PORT>/v1/metrics
+  # (velo fan-out). With the CD-snapshot-extended wheel/bins this carries the full
+  # kvbm_cd_* surface (local-vs-remote decisions, local/remote token sums, the
+  # remote/prefix/computed histograms, reconciliation) plus the G2/G3 pool
+  # populations — so NO leader stands up its own axum on a fixed port.
+  # (DYN_KVBM_METRICS, which would start that axum, is intentionally unset.)
+  KVBM_CONTROL_METRICS: "true"
+  # Logging: default ERROR, set on BOTH knobs together — DYN_LOG (dynamo frontend)
+  # and RUST_LOG (kvbm connector/engine + kvbm_hub). The CD path emits per-request
+  # tracing::info!, so base-info floods long runs; ERROR keeps a load test quiet.
+  # The CD metrics above are the durable, log-level-independent observability signal.
+  DYN_LOG: "error"
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4                   # ptyche GB200: 4 GPUs + 2 NUMA per node
+  # Decode plane = AGGREGATED TEP=4 workers (>=2 so the router can make a
+  # cache-aware choice). 2 workers x 4 GPUs = 2 GB200 nodes.   <-- TUNABLE
+  agg_nodes: 2
+  agg_workers: 2
+  gpus_per_agg: 4
+  # Hub-owned PREFILL ASIDE: extra GPU node(s) for kvbm.vllm.prefill, reserved on
+  # top of the decode plane (folds into total_nodes; dynamo-invisible).   <-- TUNABLE
+  kvbm_prefill_nodes: 1
+  kvbm_prefill_tp: 4
+
+infra:
+  # Dedicate a node for etcd/nats + the kvbm_hub aux-service.
+  etcd_nats_dedicated_node: true
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: "kv"
+    router-kv-events: true
+    router-min-initial-workers: 2   # = agg_workers (decode only; prefill is invisible)
+
+backend:
+  type: vllm
+
+  # KVBM hub (conditional-disagg + remote-search). Launches kvbm_hub on the infra
+  # node and makes the agg/decode workers register the kvbm v2 connector against
+  # it (prefix-caching + KV events are forced ON by the backend for this path).
+  kvbm_hub:
+    block_layout: operational          # symmetric TP (decode TEP4 == prefill tp4)
+    min_remote_prefill_tokens: 256     # ThresholdRemote: <256 prefill locally, >=256 disaggregate  <-- CD TUNABLE
+    host_cache_gb: 400.0               # 235B TEP4: ~100 GiB/rank G2 host cache (env = TP*per-rank)  <-- TUNABLE
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+      tensor-parallel-size: 4
+      enable-expert-parallel: true     # TEP: required for qwen3_moe (128 experts)
+      gpu-memory-utilization: 0.85
+      block-size: 64                   # MUST match the hub --block-size (read from here)
+      # max-model-len drives the on-GPU (G1) KV budget. The SA `…_256k` dataset
+      # targets up to 256k context; the model's native max is 262144. 256k KV on
+      # GB200 is large even at FP8 — KVBM tiers the cold blocks to the G2 host
+      # cache (host_cache_gb above), which is the point of this load test. Start
+      # here and lower if G1 alloc fails at bringup.   <-- KEY TUNABLE
+      max-model-len: 262144            # MUST match the hub --max-seq-len (read from here)
+      # enable-prefix-caching is forced ON by the kvbm_hub path (do not set
+      # no-enable-prefix-caching here — it is stripped). Prefix caching is what
+      # makes base_offset>0 CD prefix-hit remote-prefills exercise (the validated path).
+
+# --- Qwen3-32B smoke override (plumbing-only; if the SA traces really are long the
+#     32B's 40k context would truncate them, so for a pure wiring smoke prefer a
+#     short/no-subagents public_dataset variant) ---------------------------------
+# model: { path: "hf:Qwen/Qwen3-32B", precision: "bf16" }
+# environment.ENABLE_EXPERT_PARALLEL: "0"
+# resources: { gpu_type: gb200, gpus_per_node: 4, agg_nodes: 1, agg_workers: 2, gpus_per_agg: 2, kvbm_prefill_nodes: 1, kvbm_prefill_tp: 2 }
+# backend.kvbm_hub.host_cache_gb: 100.0
+# vllm_config.aggregated: { served-model-name: "Qwen/Qwen3-32B", tensor-parallel-size: 2, enable-expert-parallel: false, block-size: 64, max-model-len: 40960 }
+
+benchmark:
+  # trace-replay-sa: aiperf pulls the SemiAnalysis CC-traces public dataset from HF
+  # via --public-dataset and replays it as a chat workload across concurrency levels.
+  type: "trace-replay-sa"
+  public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
+  num_dataset_entries: 470           # full corpus of the with-subagents 256k variant (470 traces)
+  concurrencies: "24"                # <-- LOAD TUNABLE (comma-separated to sweep, e.g. "8,16,24")
+  ttft_threshold_ms: 5000            # goodput TTFT threshold (long agentic prompts)
+  itl_threshold_ms: 10
+  # The SA public-dataset loaders only exist on the cquil11/aiperf fork. Pinned to
+  # the 2026-06-02 tip that adds the with_subagents / 256k loaders + weka_trace
+  # reconstruction + server-metrics fixes (from karen-sy/srt-slurm-nv@d1b6e0d).
+  aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"
+  aiperf_args:
+    benchmark-duration: 300          # 5 min/concurrency
+    benchmark-grace-period: 30
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 60
+    export-http-trace: true

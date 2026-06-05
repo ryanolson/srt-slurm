@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from srtctl.backends.sglang import SGLangProtocol
-from srtctl.backends.vllm import VLLMProtocol
+from srtctl.backends.vllm import KvbmHubConfig, VLLMProtocol
 from srtctl.cli.mixins import (
     BenchmarkStageMixin,
     FrontendStageMixin,
@@ -59,6 +59,85 @@ from srtctl.ports import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def build_kvbm_hub_command(
+    hub_cfg: KvbmHubConfig,
+    *,
+    block_size: int,
+    max_seq_len: int,
+    infra_node: str,
+    discovery_port: int,
+    control_port: int,
+    velo_port: int,
+) -> list[str]:
+    """Build the kvbm_hub launch argv (pure, no srun) for start_kvbm_hub.
+
+    Extracted so the dry-run test can assert the launch flags without standing up
+    SLURM. The CD circuit breaker is configured HERE, on the hub: when
+    ``hub_cfg.cd_breaker_enabled`` is True the breaker's master enable
+    (``--cd-breaker``) and its watermark/debounce flags are appended. The hub's
+    clap parser requires ``--prefill-router`` for ``--cd-breaker`` (the breaker
+    senses the router's free-capacity fraction) — ``--prefill-router`` is always
+    passed below, so the gate is satisfied. cd_breaker_enabled None/False =>
+    ``--cd-breaker`` is omitted => the hub never constructs the breaker => decode
+    stays CALM (byte-identical to today).
+
+    The queue-depth trip axis (``cd_breaker_queue_depth_warm/hot``) has NO hub
+    CLI flag yet (the hub hardcodes 0/DISABLED pending the P2 accessor), so those
+    fields are intentionally NOT routed here.
+    """
+    # KvbmConfig overrides (one --kvbm KEY.PATH=VALUE per entry), mirroring the
+    # validated harness run-hub.sh "dynamo" arm.
+    kvbm_overrides = [
+        "leader.tokio.worker_threads=2",
+        "worker.tokio.worker_threads=2",
+        "leader.control.metrics=true",
+        "leader.control.dev=true",
+        f"leader.onboard.mode={hub_cfg.onboard_mode}",
+        "worker.nixl.backends.UCX={}",
+        "worker.nixl.backends.POSIX={}",
+    ]
+    if hub_cfg.remote_search:
+        kvbm_overrides.append("leader.remote_search.enabled=true")
+
+    command = [
+        hub_cfg.hub_binary,
+        "--discovery-port", str(discovery_port),
+        "--control-port", str(control_port),
+        "--velo-port", str(velo_port),
+        "--heartbeat-interval-secs", "10",
+        "--block-size", str(block_size),
+        "--max-seq-len", str(max_seq_len),
+        "--layout", hub_cfg.block_layout,
+        "--kv-index-advertise-host", infra_node,
+        "--features", hub_cfg.features,
+        "--g2-memory", str(int(hub_cfg.host_cache_gb)),
+        "--prefill-router",
+        "--prefill-worker-concurrency", "4",
+    ]
+
+    # CD circuit breaker: master enable + watermark/debounce flags, emitted ONLY
+    # when opted in. Each watermark/debounce flag is emitted only if its value is
+    # set (None => the hub's clap default applies).
+    if hub_cfg.cd_breaker_enabled:
+        command.append("--cd-breaker")
+        if hub_cfg.cd_breaker_warm_high is not None:
+            command += ["--cd-breaker-warm-high", str(float(hub_cfg.cd_breaker_warm_high))]
+        if hub_cfg.cd_breaker_hot_high is not None:
+            command += ["--cd-breaker-hot-high", str(float(hub_cfg.cd_breaker_hot_high))]
+        if hub_cfg.cd_breaker_clear_low is not None:
+            command += ["--cd-breaker-clear-low", str(float(hub_cfg.cd_breaker_clear_low))]
+        if hub_cfg.cd_breaker_clear_debounce_ticks is not None:
+            command += [
+                "--cd-breaker-clear-debounce-ticks",
+                str(int(hub_cfg.cd_breaker_clear_debounce_ticks)),
+            ]
+
+    for kv in kvbm_overrides:
+        command += ["--kvbm", kv]
+
+    return command
 
 
 @dataclass
@@ -284,37 +363,15 @@ class SweepOrchestrator(
         container = hub_cfg.container or str(self.runtime.container_image)
         hub_log = self.runtime.log_dir / "kvbm_hub.out"
 
-        # KvbmConfig overrides (one --kvbm KEY.PATH=VALUE per entry), mirroring the
-        # validated harness run-hub.sh "dynamo" arm.
-        kvbm_overrides = [
-            "leader.tokio.worker_threads=2",
-            "worker.tokio.worker_threads=2",
-            "leader.control.metrics=true",
-            "leader.control.dev=true",
-            f"leader.onboard.mode={hub_cfg.onboard_mode}",
-            "worker.nixl.backends.UCX={}",
-            "worker.nixl.backends.POSIX={}",
-        ]
-        if hub_cfg.remote_search:
-            kvbm_overrides.append("leader.remote_search.enabled=true")
-
-        command = [
-            hub_cfg.hub_binary,
-            "--discovery-port", str(KVBM_HUB_DISCOVERY_PORT),
-            "--control-port", str(KVBM_HUB_CONTROL_PORT),
-            "--velo-port", str(KVBM_HUB_VELO_PORT),
-            "--heartbeat-interval-secs", "10",
-            "--block-size", str(backend.kvbm_block_size()),
-            "--max-seq-len", str(backend.kvbm_max_seq_len()),
-            "--layout", hub_cfg.block_layout,
-            "--kv-index-advertise-host", infra_node,
-            "--features", hub_cfg.features,
-            "--g2-memory", str(int(hub_cfg.host_cache_gb)),
-            "--prefill-router",
-            "--prefill-worker-concurrency", "4",
-        ]
-        for kv in kvbm_overrides:
-            command += ["--kvbm", kv]
+        command = build_kvbm_hub_command(
+            hub_cfg,
+            block_size=backend.kvbm_block_size(),
+            max_seq_len=backend.kvbm_max_seq_len(),
+            infra_node=infra_node,
+            discovery_port=KVBM_HUB_DISCOVERY_PORT,
+            control_port=KVBM_HUB_CONTROL_PORT,
+            velo_port=KVBM_HUB_VELO_PORT,
+        )
 
         logger.info(
             "Starting kvbm_hub on %s (discovery=%d, control=%d, velo=%d, features=%s, layout=%s)",

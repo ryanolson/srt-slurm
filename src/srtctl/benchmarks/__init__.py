@@ -16,6 +16,7 @@ from srtctl.benchmarks import (
     sa_bench,
     sglang_bench,
     trace_replay,
+    trace_replay_sa,
 )
 from srtctl.benchmarks.base import (
     BenchmarkRunner,
@@ -41,4 +42,5 @@ __all__ = [
     "router",
     "mooncake_router",
     "trace_replay",
+    "trace_replay_sa",
 ]

@@ -1,0 +1,86 @@
+# SMOKE for the agg baseline's NOVEL standalone-kvbm (no-hub) path. Cheap + fast +
+# decoupled from the dataset/re-bake: 1 decode node (Qwen3-32B bf16, 8k ctx, ~2-min
+# load) + 1 infra = 2 nodes, synthetic sa-bench load (no dataset/aiperf-fork needed).
+#
+# Validates the novelty BEFORE the 7-node 235B/20-min gate run: plane comes up under
+# round-robin + the standalone kvbm v2 connector, G2 host cache allocates, and it
+# serves requests. The 235B/900-GiB host-pinning is NOT covered here (that's the real
+# agg run) — this only de-risks the connector wiring, which is model-size-independent.
+#
+# Uses the SAME re-baked production image + standalone connector shape as
+# agg-baseline-trace-replay-sa.yaml, scaled down (cache.host 50 GiB, 8k ctx, TP2).
+
+name: "kvbm-agg-baseline-smoke"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  time_limit: "00:40:00"
+
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  path: "hf:Qwen/Qwen3-32B"
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260603b.sqsh"
+  precision: "bf16"
+
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  ENABLE_EXPERT_PARALLEL: "0"          # 32B is dense
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  DYN_LOG: "warn"                       # a bit louder for the smoke (see G2 alloc/serve)
+  RUST_LOG: "warn,kvbm_audit=info"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4
+  # 2 TP2 AGG workers on ONE node (de-risks the connector with minimal GPUs).
+  agg_nodes: 1
+  agg_workers: 2
+  gpus_per_agg: 2
+
+infra:
+  etcd_nats_dedicated_node: true
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-reset-states: true          # round-robin (no KV events)
+
+backend:
+  type: vllm
+
+  # Standalone kvbm v2 connector (no hub) — same shape as the real agg baseline,
+  # scaled down: cache.host 50 GiB (G2), 8k max_seq_len, block_layout operational.
+  connector: '{"kv_connector": "DynamoConnector", "kv_role": "kv_both", "kv_connector_module_path": "kvbm.v2.vllm.connector", "kv_connector_extra_config": {"default": {"block_layout": "operational"}, "leader": {"cache": {"host": {"cache_size_gb": 50.0}}, "max_seq_len": 8192}, "worker": {"nixl": {"backends": {"UCX": {}, "POSIX": {}}}}}}'
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "Qwen/Qwen3-32B"
+      tensor-parallel-size: 2
+      gpu-memory-utilization: 0.85
+      block-size: 64
+      max-model-len: 8192
+      enable-prefix-caching: true
+
+benchmark:
+  # Synthetic load — no public dataset, no aiperf-fork dependency.
+  type: "sa-bench"
+  isl: 512
+  osl: 128
+  concurrencies: "2"

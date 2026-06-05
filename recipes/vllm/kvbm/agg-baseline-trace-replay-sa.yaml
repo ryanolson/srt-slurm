@@ -1,0 +1,139 @@
+# EXPERIMENT agg baseline — Traditional AGGREGATED serving, KVBM STANDALONE (no hub).
+#
+# The control for the agg-vs-CD comparison. 6 AGGREGATED decode workers (TEP=4, one
+# GB200 node each) behind the dynamo frontend with ROUND-ROBIN routing. NO kvbm_hub,
+# NO conditional-disagg, NO remote-search, NO prefill aside. Each worker runs the
+# kvbm v2 connector in STANDALONE (hub-less) mode: G1 (vLLM GPU) prefix caching ON +
+# G2 (kvbm host/Grace) offload. This measures plain aggregated throughput/latency
+# with local tiered KV, i.e. the value of deploying the full CD plane (cd#1/cd#2) is
+# the delta over THIS.
+#
+# Topology: 6 decode = 6 GB200 serving nodes + 1 dedicated infra node (etcd/nats) =
+# 7 nodes — matching cd#1/cd#2's footprint for a fair comparison.
+#
+# ROUTING NOTE: this baseline uses round-robin (not the kv-router the CD runs use).
+# A standalone-kvbm + kv-router agg would require a srt-slurm code change (the
+# non-hub path doesn't wire the per-worker --kv-events-config the kv-router needs,
+# and a recipe can't reference the runtime-allocated kv_events_port). Round-robin
+# keeps the gate experiment code-free; the comparison measures the CD plane as a
+# whole (remote-search + disagg + cache-aware routing) vs plain agg.
+#
+# NOVEL CONFIG: no standalone-kvbm run exists in this workspace's history — every
+# prior kvbm run went through the hub. Smoke-validated separately (plane up + serves
+# + G2 alloc) before this full run. See docs/runs/cd_comparison_experiments.md.
+
+name: "kvbm-agg-baseline-trace-replay-sa"
+
+identity:
+  model:
+    repo: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+    revision: "1c4ec35802abf3a20672be7e5c51a098796f71d6"
+  container:
+    image: "nvcr.io/nvidian/dynamo-dev/ryan:kvbm-vllm-dev-260602"
+  frameworks:
+    dynamo: "1.2.0"
+    vllm: "0.21.0"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  time_limit: "01:45:00"
+
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260603b.sqsh"
+  precision: "fp4"
+
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  ENABLE_EXPERT_PARALLEL: "1"
+  # cache.host (G2) in the connector below auto-enables NIXL/UCX (local G1<->G2
+  # staging), so the plugin dir must match the cu13 wheel's libnixl, same as the CD runs.
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  # No KVBM_CONTROL_METRICS: there is no hub to aggregate a control-plane pull.
+  DYN_LOG: "error"
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4
+  # Decode plane: 4 AGGREGATED TEP=4 workers, one GB200 node each. No prefill aside.
+  # (Reduced 6->4 to concentrate load per worker — at 6 nodes/conc24 effective
+  # concurrency was only ~8 and kv_usage ~10%; 4 nodes/conc48 raises per-node load ~3x.)
+  agg_nodes: 4
+  agg_workers: 4
+  gpus_per_agg: 4
+
+infra:
+  # Co-locate etcd/nats + the dynamo frontend on a serving node (NO dedicated infra
+  # node) so the total is exactly 4 GB200 nodes (= 4 decode).
+  etcd_nats_dedicated_node: false
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    # Round-robin routing (no KV-router, no KV events) — the "traditional agg" baseline.
+    router-reset-states: true
+
+backend:
+  type: vllm
+
+  # STANDALONE kvbm v2 connector (no hub): local G1<->G2<->(G3) tiering only. The
+  # `connector:` field accepts a raw --kv-transfer-config JSON string and passes it
+  # through untouched. Key differences from the hub connector: NO `leader.hub`, NO
+  # `disagg`, NO `remote_search` — just `cache.host` for the G2 (Grace) host cache.
+  # host cache_size_gb is PER-RANK (total pinned = TP * value), confirmed by the OOMs
+  # (jobs 2184830/2184882: 900,600 * TP4 = 3600,2400 GiB). MEASURED on a decode node:
+  # 955.7 GiB physical, but the slurm job cgroup hard-caps at ~890 GiB; at 100/rank the
+  # job already uses ~570 GiB (overhead ~190 = 4 worker CUDA/torch + vLLM/NIXL shmem).
+  # 160/rank * TP4 = 640 GiB total => ~850 GiB used, ~100 GiB margin. Largest safe
+  # value on these nodes (200/rank would need ~1012 > 890 cap = OOM).
+  connector: '{"kv_connector": "DynamoConnector", "kv_role": "kv_both", "kv_connector_module_path": "kvbm.v2.vllm.connector", "kv_connector_extra_config": {"default": {"block_layout": "operational"}, "leader": {"cache": {"host": {"cache_size_gb": 160.0}}, "max_seq_len": 262144}, "worker": {"nixl": {"backends": {"UCX": {}, "POSIX": {}}}}}}'
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+      tensor-parallel-size: 4
+      enable-expert-parallel: true
+      gpu-memory-utilization: 0.85
+      block-size: 64                   # G1 (vLLM) block size — matches the CD runs
+      max-model-len: 262144
+      # No hub to force it on, so enable G1 prefix caching EXPLICITLY (production run:
+      # we want both G1 prefix cache + G2 offload active, unlike the smoke tests which
+      # disabled G1 prefix caching to surface G2 hits).
+      enable-prefix-caching: true
+
+benchmark:
+  type: "trace-replay-sa"
+  public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
+  num_dataset_entries: 470           # full with-subagents 256k corpus (470 traces)
+  concurrencies: "48"
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 10
+  aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"
+  aiperf_args:
+    benchmark-duration: 1200
+    benchmark-grace-period: 30
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 120
+    export-http-trace: true

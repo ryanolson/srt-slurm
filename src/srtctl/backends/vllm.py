@@ -90,7 +90,32 @@ class KvbmHubConfig:
     features: str = "indexer,p2p,disagg"
     block_layout: str = "operational"
     min_remote_prefill_tokens: int = 256
+    # Decode-side B-GNMT overflow budget: max in-flight remote-prefill TOKENS across all
+    # outstanding disaggregations. When exhausted, a request that would disaggregate is
+    # DOWNGRADED to local prefill on the decode worker (the "use decode to help prefill in
+    # a heavy wave" adaptation). None => connector default usize::MAX => feature inert.
+    max_inflight_remote_prefill_tokens: int | None = None
+    # CD prefill-overload circuit breaker (router-sourced 3-tier). The breaker is
+    # configured ENTIRELY on the hub: when cd_breaker_enabled is True these route
+    # to the kvbm_hub --cd-breaker* CLI flags (do_sweep.build_kvbm_hub_command).
+    # cd_breaker_enabled None/False => no --cd-breaker => the hub never constructs
+    # the breaker => decode stays CALM (byte-identical to today). Set
+    # cd_breaker_enabled=True to opt in; the watermarks are expressed against the
+    # router's free-capacity fraction [0.0, 1.0] (lower = more pressure). See the
+    # kvbm-hub CircuitBreaker for the exact semantics.
+    cd_breaker_enabled: bool | None = None
+    cd_breaker_warm_high: float | None = None
+    cd_breaker_hot_high: float | None = None
+    cd_breaker_clear_low: float | None = None
+    # NOTE: the queue-depth trip axis has NO kvbm_hub CLI flag yet — the hub
+    # hardcodes queue_depth_warm/hot = 0 (DISABLED) pending the P2 queue-depth
+    # accessor. These two fields are retained for forward-compat but are NOT
+    # routed to the hub today (setting them is a no-op until the flag lands).
+    cd_breaker_queue_depth_warm: int | None = None
+    cd_breaker_queue_depth_hot: int | None = None
+    cd_breaker_clear_debounce_ticks: int | None = None
     host_cache_gb: float = 100.0
+    prefill_max_num_seqs: int | None = None  # cap the prefill aside's in-flight requests (vLLM --max-num-seqs)
     remote_search: bool = True          # decode: remote-search ON by default
     remote_search_prefill: bool = False  # prefill: OFF by default (pure CD target; no indexer)
     onboard_mode: str = "inter"
@@ -154,6 +179,15 @@ class VLLMProtocol:
     # node separation.
     allow_prefill_decode_colocation: bool = False
 
+    # Aggregated KV-aware-routing baseline: enable the in-process KV consolidator +
+    # per-worker KV events on AGG workers using the recipe's raw kvbm v2 ``connector``,
+    # WITHOUT a hub or prefill aside. This is the CD decode plane's routing methodology
+    # (consolidator relays G1+G2 events to the dynamo KV-router; prefix-caching forced ON)
+    # minus the disagg sidecar — so an agg baseline routes iso with CD and the agg-vs-CD
+    # delta isolates conditional disaggregation. Requires a kvbm v2 ``connector`` + a
+    # KV-router frontend (router-mode: kv, router-kv-events: true). Ignored if kvbm_hub is set.
+    kvbm_consolidator: bool = False
+
     Schema: ClassVar[builtins.type[Schema]] = Schema
 
     # =========================================================================
@@ -201,12 +235,14 @@ class VLLMProtocol:
             env["DYN_VLLM_KV_EVENT_PORT"] = str(process.kv_events_port)
         if process.nixl_port is not None:
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(process.nixl_port)
-        # Deterministic per-worker KVBM leader ZMQ ports so co-located decode
-        # workers don't collide on the default 56001 (the in-process consolidator
-        # derives its egress port from DYN_KVBM_LEADER_ZMQ_PUB_PORT). This mirrors
-        # worker_stage._apply_kvbm_endpoint_env, which only fires for the
-        # DYN_CONNECTOR=kvbm path — our connector arrives via --kv-transfer-config.
-        if self.kvbm_hub is not None and process.kv_events_port is not None:
+        # Deterministic per-worker KVBM leader ZMQ ports so co-located workers don't
+        # collide on the default 56001 (the in-process consolidator derives its egress
+        # port from DYN_KVBM_LEADER_ZMQ_PUB_PORT). Required for BOTH consolidator paths:
+        # the CD decode plane (kvbm_hub) AND the hub-less agg consolidator baseline
+        # (kvbm_consolidator) — else 2 bin-packed agg workers/node both bind the default
+        # port and EngineCore init fails. Mirrors worker_stage._apply_kvbm_endpoint_env
+        # (DYN_CONNECTOR=kvbm path); our connector arrives via --kv-transfer-config.
+        if (self.kvbm_hub is not None or self.kvbm_consolidator) and process.kv_events_port is not None:
             port_offset = max(0, process.kv_events_port - KV_EVENTS_PORT_BASE)
             pub_port = KVBM_ZMQ_PORT_BASE + (port_offset * 2)
             if pub_port + 1 <= 65535:
@@ -246,6 +282,26 @@ class VLLMProtocol:
     def kvbm_max_seq_len(self) -> int:
         return int(self._vllm_cfg_value("max-model-len", "max_model_len", default=40960))
 
+    def _enable_kvbm_consolidator(self, cmd: list[str], config: dict[str, Any], process: Process) -> None:
+        """Apply the in-process KV-consolidator prerequisites to an AGG worker — the
+        single source of truth shared by the CD decode plane and the hub-less agg
+        consolidator baseline, so both route with the identical methodology.
+
+        The consolidator hard-requires prefix-caching (force it ON; drop any recipe
+        no-enable-prefix-caching that would silently blind the router) and consumes the
+        worker's vLLM KV events, so emit them on the per-worker ZMQ port (its source).
+        The consolidator itself is default-on in the kvbm v2 connector once a
+        kv_transfer_config + kv-events are present (DYN_KVBM_KV_EVENTS_CONSOLIDATOR_MODE
+        defaults to "dedup"); it relays G1+G2 events to the dynamo KV-router in-process,
+        independent of the hub.
+        """
+        config.pop("no-enable-prefix-caching", None)
+        config.pop("no_enable_prefix_caching", None)
+        config["enable-prefix-caching"] = True
+        if process.kv_events_port is not None:
+            kv_events = {"endpoint": f"tcp://*:{process.kv_events_port}", "enable_kv_cache_events": True}
+            cmd.extend(["--kv-events-config", json.dumps(kv_events)])
+
     def build_kvbm_hub_connector(self, role: str, hub_url: str) -> str:
         """Build the STATIC kvbm v2 connector --kv-transfer-config JSON for a
         hub-registered worker (role ``decode`` or ``prefill``).
@@ -269,6 +325,16 @@ class VLLMProtocol:
         }
         if role == "decode":
             leader["disagg"]["min_remote_prefill_tokens"] = int(h.min_remote_prefill_tokens)
+            if h.max_inflight_remote_prefill_tokens is not None:
+                # Finite budget => B-GNMT downgrade-to-local arms on overload (heavy wave).
+                leader["disagg"]["max_inflight_remote_prefill_tokens"] = int(h.max_inflight_remote_prefill_tokens)
+            # NOTE: the CD circuit breaker is configured ENTIRELY on the hub via
+            # the kvbm_hub --cd-breaker* CLI flags (see do_sweep.build_kvbm_hub_command),
+            # NOT on the connector. The breaker lives in the hub's prefill-router
+            # and PUSHES the resulting tier to decodes over velo; the connector
+            # only consumes the pushed tier at runtime. The cd_breaker_* fields
+            # on KvbmHubConfig are the recipe's representation and are routed to
+            # the hub CLI, never into this connector JSON.
             if h.remote_search:
                 leader["remote_search"] = {"enabled": True}
         elif role == "prefill":
@@ -321,6 +387,12 @@ class VLLMProtocol:
         ]
         if agg.get("enable-expert-parallel") or agg.get("enable_expert_parallel"):
             cmd.append("--enable-expert-parallel")
+        # Cap the prefill aside's in-flight requests (vLLM running batch). The prefill
+        # aside is compute-bound and lightly loaded under CD; a small cap bounds its
+        # activation memory (headroom for weights + KV on tight TP=1 prefill) without
+        # hurting throughput. None => vLLM default.
+        if self.kvbm_hub.prefill_max_num_seqs is not None:
+            cmd.extend(["--max-num-seqs", str(self.kvbm_hub.prefill_max_num_seqs)])
         cmd.extend(["--kv-transfer-config", self.build_kvbm_hub_connector("prefill", hub_url)])
         return cmd
 
@@ -552,7 +624,7 @@ class VLLMProtocol:
 
         # KV connector → --kv-transfer-config (dynamo 1.0.0+: --connector was removed)
         if self.kvbm_hub is not None and mode == "agg":
-            # Decode plane: register the kvbm v2 connector against the hub on the
+            # CD decode plane: register the kvbm v2 connector against the hub on the
             # infra node (role=decode). Decode runs AGGREGATED (note: no
             # --disaggregation-mode above for "agg") so the KV-event publisher
             # stays alive and the in-process consolidator relays to the dynamo
@@ -560,15 +632,17 @@ class VLLMProtocol:
             config.pop("connector", None)
             hub_url = f"http://{runtime.nodes.infra}:{KVBM_HUB_DISCOVERY_PORT}"
             cmd.extend(["--kv-transfer-config", self.build_kvbm_hub_connector("decode", hub_url)])
-            # Force prefix-caching ON (the consolidator hard-requires it); drop any
-            # recipe no-enable-prefix-caching that would silently blind the router.
-            config.pop("no-enable-prefix-caching", None)
-            config.pop("no_enable_prefix_caching", None)
-            config["enable-prefix-caching"] = True
-            # Emit vLLM KV events on the per-worker ZMQ port (the consolidator's source).
-            if process.kv_events_port is not None:
-                kv_events = {"endpoint": f"tcp://*:{process.kv_events_port}", "enable_kv_cache_events": True}
-                cmd.extend(["--kv-events-config", json.dumps(kv_events)])
+            self._enable_kvbm_consolidator(cmd, config, process)
+        elif self.kvbm_consolidator and self.kvbm_hub is None and mode == "agg":
+            # Aggregated KV-aware-routing baseline: the SAME in-process consolidator +
+            # KV-router methodology as the CD decode plane, but WITHOUT the hub/prefill
+            # sidecar — use the recipe's RAW kvbm v2 connector (no leader.hub, no disagg).
+            # So agg routes iso with CD (G1+G2 dedup) and agg-vs-CD isolates disaggregation.
+            mode_connector = config.pop("connector", None)
+            connector = mode_connector if mode_connector is not None else self.connector
+            if connector and connector not in ("null", "none", None):
+                cmd.extend(["--kv-transfer-config", _connector_to_kv_transfer_config(connector)])
+            self._enable_kvbm_consolidator(cmd, config, process)
         else:
             # Check for mode-specific override first, then fall back to default.
             # Pop from config so it doesn't get added again by _config_to_cli_args.

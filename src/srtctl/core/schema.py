@@ -244,6 +244,7 @@ class BenchmarkType(str, Enum):
     ROUTER = "router"
     MOONCAKE_ROUTER = "mooncake-router"
     TRACE_REPLAY = "trace-replay"
+    TRACE_REPLAY_SA = "trace-replay-sa"
     MMLU = "mmlu"
     GPQA = "gpqa"
     GSM8K = "gsm8k"
@@ -705,6 +706,12 @@ class BenchmarkConfig:
     dataset_path: str | None = None  # Container path to dataset file (mount via extra_mount)
     # Trace replay benchmark fields (uses aiperf with mooncake_trace dataset type)
     trace_file: str | None = None  # Path to trace JSONL file (container path, e.g., /traces/dataset.jsonl)
+    # Trace replay (SA) benchmark fields (uses aiperf --public-dataset; the SemiAnalysis
+    # loaders live in the cquil11/aiperf fork pinned via aiperf_package). public_dataset is
+    # required for trace-replay-sa, e.g. "semianalysis_cc_traces_weka_with_subagents_256k".
+    # num_dataset_entries is optional (unset => aiperf uses the full corpus).
+    public_dataset: str | None = None  # aiperf public-dataset name
+    num_dataset_entries: int | None = None  # Number of dataset entries to load (default: all)
     custom_tokenizer: str | None = None  # Custom tokenizer class (e.g., "module.path.ClassName")
     use_chat_template: bool = True  # Pass --use-chat-template to benchmark (default: true)
     # Custom benchmark hook.

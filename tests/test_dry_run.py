@@ -15,6 +15,7 @@ import yaml
 from srtctl.backends.vllm import KvbmHubConfig, VLLMProtocol, VLLMServerConfig
 from srtctl.cli.submit import show_config_details
 from srtctl.core.schema import SrtConfig
+from srtctl.ports import KV_EVENTS_PORT_BASE
 
 # Minimal valid config that all tests build on
 BASE_CONFIG = {
@@ -372,6 +373,186 @@ class TestDryRunKvbmHub:
         # (provable in the static config; default decode=on / prefill=off).
         assert "min_remote_prefill_tokens" not in pleader["disagg"]
         assert pleader["remote_search"] == {"enabled": False}
+
+    def test_kvbm_hub_connector_overflow_budget(self):
+        """max_inflight_remote_prefill_tokens arms decode-side B-GNMT downgrade-to-local;
+        absent by default (connector usize::MAX => inert), present iff set in the recipe."""
+        # default: key omitted => connector default usize::MAX => feature inert
+        default_backend = VLLMProtocol(
+            kvbm_hub=KvbmHubConfig(min_remote_prefill_tokens=1024),
+            vllm_config=VLLMServerConfig(aggregated={"block-size": 64, "max-model-len": 40960}),
+        )
+        dleader = json.loads(default_backend.build_kvbm_hub_connector("decode", "http://infra0:1337"))[
+            "kv_connector_extra_config"
+        ]["leader"]
+        assert "max_inflight_remote_prefill_tokens" not in dleader["disagg"]
+
+        # finite budget => key surfaces on the DECODE connector only
+        backend = VLLMProtocol(
+            kvbm_hub=KvbmHubConfig(min_remote_prefill_tokens=1024, max_inflight_remote_prefill_tokens=131072),
+            vllm_config=VLLMServerConfig(aggregated={"block-size": 64, "max-model-len": 40960}),
+        )
+        leader = json.loads(backend.build_kvbm_hub_connector("decode", "http://infra0:1337"))[
+            "kv_connector_extra_config"
+        ]["leader"]
+        assert leader["disagg"]["max_inflight_remote_prefill_tokens"] == 131072
+        assert leader["disagg"]["min_remote_prefill_tokens"] == 1024
+        # the prefill connector never carries the decode-only overflow budget
+        pleader = json.loads(backend.build_kvbm_hub_connector("prefill", "http://infra0:1337"))[
+            "kv_connector_extra_config"
+        ]["leader"]
+        assert "max_inflight_remote_prefill_tokens" not in pleader["disagg"]
+
+    def test_kvbm_hub_connector_omits_breaker_knobs(self):
+        """The CD circuit breaker is configured on the HUB CLI, NOT on the
+        connector. The cd_breaker_* knobs must NEVER appear in the connector's
+        --kv-transfer-config JSON, even when opted in (the connector reads only
+        the hub-pushed tier at runtime). Asserted on decode and prefill."""
+        backend = VLLMProtocol(
+            kvbm_hub=KvbmHubConfig(
+                min_remote_prefill_tokens=1024,
+                cd_breaker_enabled=True,
+                cd_breaker_warm_high=0.4,
+                cd_breaker_hot_high=0.1,
+                cd_breaker_clear_low=0.8,
+                cd_breaker_clear_debounce_ticks=5,
+            ),
+            vllm_config=VLLMServerConfig(aggregated={"block-size": 64, "max-model-len": 40960}),
+        )
+        for role in ("decode", "prefill"):
+            leader = json.loads(backend.build_kvbm_hub_connector(role, "http://infra0:1337"))[
+                "kv_connector_extra_config"
+            ]["leader"]
+            for key in (
+                "cd_breaker_enabled",
+                "cd_breaker_warm_high",
+                "cd_breaker_hot_high",
+                "cd_breaker_clear_low",
+                "cd_breaker_queue_depth_warm",
+                "cd_breaker_queue_depth_hot",
+                "cd_breaker_clear_debounce_ticks",
+            ):
+                assert key not in leader["disagg"], f"{key} must never appear in the {role} connector"
+
+    def test_kvbm_hub_launch_command_circuit_breaker(self):
+        """The hub LAUNCH command carries --cd-breaker (+ watermark/debounce
+        flags) ONLY when cd_breaker_enabled is True; omitting it (or False) =>
+        no --cd-breaker => the hub never constructs the breaker (byte-identical
+        to today). The queue-depth knobs have NO hub flag, so they are never
+        emitted. The breaker requires --prefill-router, which is always passed."""
+        from srtctl.cli.do_sweep import build_kvbm_hub_command
+
+        common = dict(
+            block_size=64,
+            max_seq_len=40960,
+            infra_node="infra0",
+            discovery_port=1337,
+            control_port=8337,
+            velo_port=4317,
+        )
+
+        # OFF (default): no --cd-breaker anywhere in the argv.
+        off_cmd = build_kvbm_hub_command(KvbmHubConfig(min_remote_prefill_tokens=1024), **common)
+        assert "--prefill-router" in off_cmd, "prefill-router is always passed (breaker gate)"
+        assert "--cd-breaker" not in off_cmd
+        assert not any(a.startswith("--cd-breaker") for a in off_cmd), "no breaker flags when OFF"
+
+        # Explicit False is also OFF.
+        false_cmd = build_kvbm_hub_command(
+            KvbmHubConfig(min_remote_prefill_tokens=1024, cd_breaker_enabled=False), **common
+        )
+        assert "--cd-breaker" not in false_cmd
+
+        # ON: --cd-breaker plus each set watermark/debounce flag, in order.
+        on_cmd = build_kvbm_hub_command(
+            KvbmHubConfig(
+                min_remote_prefill_tokens=1024,
+                cd_breaker_enabled=True,
+                cd_breaker_warm_high=0.4,
+                cd_breaker_hot_high=0.1,
+                cd_breaker_clear_low=0.8,
+                cd_breaker_clear_debounce_ticks=5,
+                # queue-depth set but NOT routable (no hub flag) — must be ignored.
+                cd_breaker_queue_depth_warm=64,
+                cd_breaker_queue_depth_hot=256,
+            ),
+            **common,
+        )
+        assert "--cd-breaker" in on_cmd
+        assert "--prefill-router" in on_cmd
+        # Each flag immediately precedes its value (argv pair).
+        for flag, val in (
+            ("--cd-breaker-warm-high", "0.4"),
+            ("--cd-breaker-hot-high", "0.1"),
+            ("--cd-breaker-clear-low", "0.8"),
+            ("--cd-breaker-clear-debounce-ticks", "5"),
+        ):
+            assert flag in on_cmd, f"{flag} missing"
+            assert on_cmd[on_cmd.index(flag) + 1] == val, f"{flag} value"
+        # The queue-depth axis has no hub CLI flag — never emitted.
+        assert not any("queue-depth" in a for a in on_cmd), "queue-depth has no hub flag"
+
+    def test_kvbm_consolidator_agg_baseline(self):
+        """The hub-less agg KV-routing baseline reuses the EXACT CD decode consolidator
+        treatment (force prefix-caching ON + emit per-worker KV events — the consolidator's
+        source), so agg routes iso with CD. Shared helper == identical methodology."""
+        backend = VLLMProtocol(
+            kvbm_consolidator=True,
+            connector=(
+                '{"kv_connector":"DynamoConnector","kv_role":"kv_both",'
+                '"kv_connector_module_path":"kvbm.v2.vllm.connector","kv_connector_extra_config":{}}'
+            ),
+        )
+        assert backend.kvbm_consolidator is True
+        assert backend.kvbm_hub is None  # hub-less by construction
+        assert VLLMProtocol().kvbm_consolidator is False  # default OFF (round-robin agg unchanged)
+
+        # The shared helper applies the CD methodology to an agg worker.
+        class _Proc:
+            kv_events_port = 5200
+
+        cmd: list[str] = []
+        cfg: dict = {"no-enable-prefix-caching": True}
+        backend._enable_kvbm_consolidator(cmd, cfg, _Proc())
+        assert cfg.get("enable-prefix-caching") is True  # consolidator hard-requires it
+        assert "no-enable-prefix-caching" not in cfg  # a recipe opt-out is dropped
+        assert "--kv-events-config" in cmd
+        kv_cfg = cmd[cmd.index("--kv-events-config") + 1]
+        assert '"enable_kv_cache_events": true' in kv_cfg and "5200" in kv_cfg
+
+        # No kv_events_port => no kv-events flag, but prefix-caching is still forced.
+        class _ProcNoPort:
+            kv_events_port = None
+
+        cmd2: list[str] = []
+        cfg2: dict = {}
+        backend._enable_kvbm_consolidator(cmd2, cfg2, _ProcNoPort())
+        assert cfg2.get("enable-prefix-caching") is True
+        assert "--kv-events-config" not in cmd2
+
+    def test_kvbm_consolidator_gets_per_worker_zmq_ports(self):
+        """The hub-less consolidator path MUST get the per-worker DYN_KVBM_LEADER_ZMQ_PUB_PORT
+        offset (like the hub path), else 2 bin-packed agg workers/node collide on the default
+        56001 consolidator egress port and EngineCore init fails (job 2187950)."""
+
+        class _Proc:
+            def __init__(self, kvp):
+                self.kv_events_port = kvp
+                self.nixl_port = None
+
+        backend = VLLMProtocol(
+            kvbm_consolidator=True,
+            connector='{"kv_connector_module_path":"kvbm.v2.vllm.connector"}',
+        )
+        e0 = backend.get_process_environment(_Proc(KV_EVENTS_PORT_BASE))
+        e1 = backend.get_process_environment(_Proc(KV_EVENTS_PORT_BASE + 1))
+        assert "DYN_KVBM_LEADER_ZMQ_PUB_PORT" in e0 and "DYN_KVBM_LEADER_ZMQ_PUB_PORT" in e1
+        # distinct per co-located worker => no collision
+        assert e0["DYN_KVBM_LEADER_ZMQ_PUB_PORT"] != e1["DYN_KVBM_LEADER_ZMQ_PUB_PORT"]
+        assert e0["DYN_KVBM_LEADER_ZMQ_ACK_PORT"] != e1["DYN_KVBM_LEADER_ZMQ_ACK_PORT"]
+        # a plain agg (no consolidator, no hub) is unchanged — no kvbm ZMQ ports.
+        plain = VLLMProtocol().get_process_environment(_Proc(KV_EVENTS_PORT_BASE))
+        assert "DYN_KVBM_LEADER_ZMQ_PUB_PORT" not in plain
 
     def test_kvbm_prefill_aside_reserves_extra_nodes(self):
         """kvbm_prefill_nodes folds into total_nodes (on top of the decode plane)

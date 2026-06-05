@@ -1,0 +1,156 @@
+# EXPERIMENT cd#1 — Conditional Disaggregation, 5 decode + 1 prefill (all TEP=4).
+#
+# KVBM full-dynamo CD plane: dynamo frontend + KV-router -> 5 AGGREGATED decode
+# workers (TEP=4, one GB200 node each) running the kvbm v2 connector (role=decode)
+# against a kvbm_hub on the infra node, PLUS 1 hub-owned PREFILL ASIDE node
+# (kvbm.vllm.prefill, TEP=4). Hub in OPERATIONAL mode (symmetric TP: decode TEP4 ==
+# prefill TEP4), with indexer + p2p + disagg. Conditional Threshold = 1024 tokens
+# (ThresholdRemote: a request whose uncached remainder is < 1024 tokens prefills
+# locally on the decode worker; >= 1024 disaggregates to the prefill aside).
+#
+# Topology: 5 decode + 1 prefill = 6 GB200 serving nodes + 1 dedicated infra node
+# (etcd/nats + kvbm_hub) = 7 nodes. Benchmarked with trace-replay-sa (SemiAnalysis
+# agentic-coding traces, no-subagents variant) for 20 min @ concurrency 24.
+#
+# Part of the agg-vs-CD comparison set (see docs/runs/cd_comparison_experiments.md).
+# Sibling recipes: agg-baseline-trace-replay-sa.yaml (no hub), cd2-4d2p-...yaml.
+#
+# Decode is AGGREGATED on purpose: `--disaggregation-mode decode` disables the
+# KV-event publisher, which blinds the router.
+
+name: "kvbm-cd1-5d1p-trace-replay-sa"
+
+# Reproducibility: exact weights. revision = the verified HF commit SHA of the
+# Instruct-2507 NVFP4 download. The image is the PRODUCTION .sqsh baked from this base.
+identity:
+  model:
+    repo: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+    revision: "1c4ec35802abf3a20672be7e5c51a098796f71d6"
+  container:
+    image: "nvcr.io/nvidian/dynamo-dev/ryan:kvbm-vllm-dev-260602"
+  frameworks:
+    dynamo: "1.2.0"
+    vllm: "0.21.0"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  # 235B real-weight load + warmup + the 20-min SA sweep (benchmark-duration 1200s)
+  # + teardown. Headroom for bringup of 7 nodes.
+  time_limit: "01:45:00"
+
+# PRODUCTION image (baked): the setup_script verify-no-ops (kvbm/dynamo already in
+# the venv; hub binary at /opt/kvbm/bin). dynamo.install: false keeps PyPI off.
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+  # Re-baked production image (kvbm-prod-260603b.sqsh) — current kvbm wheel + hub/
+  # kvbmctl bins incl. the CdSnapshot hub-pull CD-metrics extension. Used for all
+  # three experiments in this set.
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260603b.sqsh"
+  precision: "fp4"
+
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  # MoE: Qwen3-235B-A22B (qwen3_moe, 128 experts) needs expert parallelism (TEP).
+  ENABLE_EXPERT_PARALLEL: "1"
+  # NIXL UCX plugin dir MUST match the cu13 wheel's libnixl (RPATH wins); the image
+  # default (/opt/dynamo/nixl/plugins) MISMATCHES => "backend 'UCX' not found".
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  # CD observability via the HUB PULL (GET http://<hub>:<CONTROL_PORT>/v1/metrics,
+  # velo fan-out) — carries the full kvbm_cd_* surface with the re-baked image. No
+  # per-worker /metrics axum (DYN_KVBM_METRICS intentionally unset).
+  KVBM_CONTROL_METRICS: "true"
+  # Quiet logging for the load test; CD metrics are the durable, log-independent signal.
+  DYN_LOG: "error"
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4
+  # Decode plane: 5 AGGREGATED TEP=4 workers, one GB200 node each.
+  agg_nodes: 5
+  agg_workers: 5
+  gpus_per_agg: 4
+  # Hub-owned PREFILL ASIDE: 1 GB200 node, TEP=4 (one worker per node).
+  kvbm_prefill_nodes: 1
+  kvbm_prefill_tp: 4
+
+infra:
+  # Co-locate etcd/nats + the kvbm_hub on a serving node (NO dedicated infra node)
+  # so the total is exactly 6 GB200 nodes (= 5 decode + 1 prefill), per spec. The hub
+  # is CPU-only coordination — light enough to share the head decode node.
+  etcd_nats_dedicated_node: false
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: "kv"
+    router-kv-events: true
+    router-min-initial-workers: 5   # = agg_workers (decode only; prefill is invisible)
+
+backend:
+  type: vllm
+
+  # KVBM hub: conditional-disagg (ThresholdRemote @ 1024) + remote-search. Launches
+  # kvbm_hub on the infra node; decode workers register the kvbm v2 connector
+  # (role=decode) against it with prefix-caching + KV events forced ON (the
+  # in-process consolidator relays to the KV-router).
+  kvbm_hub:
+    # PRODUCTION image: the hub binary is baked at /opt/kvbm/bin (not the dev
+    # /workspace/target/release).
+    hub_binary: "/opt/kvbm/bin/kvbm_hub"
+    block_layout: operational          # symmetric TP (decode TEP4 == prefill TEP4)
+    min_remote_prefill_tokens: 1024    # Conditional Threshold = 1024 tokens
+    # G2 host cache is PER-RANK (total pinned = TP * value) — confirmed by the agg
+    # OOMs + a live node probe: 955.7 GiB physical, slurm cgroup cap ~890 GiB, ~190
+    # GiB overhead. 160/rank * TP4 = 640 GiB total/node (~850 used, ~100 GiB margin).
+    # Largest safe value (200/rank would need ~1012 > 890 cap = OOM).
+    host_cache_gb: 160.0
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+      tensor-parallel-size: 4
+      enable-expert-parallel: true     # TEP: required for qwen3_moe (128 experts)
+      gpu-memory-utilization: 0.85
+      block-size: 64                   # G1 (vLLM) block size; MUST match hub --block-size
+      max-model-len: 262144            # MUST match hub --max-seq-len
+      # enable-prefix-caching is forced ON by the kvbm_hub path (G1 prefix cache).
+
+benchmark:
+  # trace-replay-sa: aiperf replays the SemiAnalysis CC-traces (no-subagents variant,
+  # semianalysisai/cc-traces-weka-no-subagents-051826, 98 traces) as a chat workload.
+  type: "trace-replay-sa"
+  public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
+  num_dataset_entries: 470           # full with-subagents 256k corpus (470 traces)
+  concurrencies: "24"
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 10
+  # SA public-dataset loaders only exist on the cquil11/aiperf fork (pinned commit).
+  aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"
+  aiperf_args:
+    benchmark-duration: 1200         # 20 min @ concurrency 24
+    benchmark-grace-period: 30
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 120
+    export-http-trace: true

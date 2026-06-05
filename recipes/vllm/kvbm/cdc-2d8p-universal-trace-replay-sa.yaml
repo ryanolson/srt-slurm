@@ -1,0 +1,128 @@
+# EXPERIMENT cd-C — Conditional Disaggregation, 2 decode (TEP=4) + 8 prefill (TP=1),
+# UNIVERSAL mode (asymmetric TP: decode TEP4 <-> prefill TP1).
+#
+# Tests the kvbm hub's UNIVERSAL block layout: 2 big AGGREGATED decode workers (TEP=4,
+# 1 GB200 node each) feeding off 8 small hub-owned PREFILL ASIDE workers (TP=1, full
+# 235B on a single GPU each, 1 worker/node). The hub's universal layout lets the TP=4
+# decode consume KV produced by TP=1 prefill. Conditional Threshold = 1024 tokens.
+#
+# Topology (ISO-GPU, 1 worker/node): decode 2xTEP4 = 2 nodes (full); prefill 8xTP1 =
+# 8 nodes (1 worker/node, 1 of 4 GPUs each — srt-slurm launches 1 prefill worker/node)
+# => 10 GB200 nodes total, 16 GPUs used. (8 prefill nodes leave 3 idle GPUs each; the
+# srt-slurm prefill aside is 1 worker/node, so TP1 prefill cannot pack — that's the
+# cost of universal-mode TP1 prefill without a packing change.) etcd/nats + hub
+# co-located on the head decode node. See docs/runs/cd_comparison_experiments.md.
+#
+# NOVEL/RISK: TP=1 means the FULL 235B-NVFP4 (~118 GB) on ONE GPU (186 GB HBM) — tight
+# but should fit (~60 GB left for KV/activation). EP across 1 rank is trivial. Universal
+# mode + TP1 prefill is untested here; watch bringup (weight fit, hub register, disagg).
+
+name: "kvbm-cdc-2d8p-universal-trace-replay-sa"
+
+identity:
+  model:
+    repo: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+    revision: "1c4ec35802abf3a20672be7e5c51a098796f71d6"
+  container:
+    image: "nvcr.io/nvidian/dynamo-dev/ryan:kvbm-vllm-dev-260602"
+  frameworks:
+    dynamo: "1.2.0"
+    vllm: "0.21.0"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  time_limit: "01:45:00"
+
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260604.sqsh"  # FP8 permute kernels (universal/FP8 support)
+  precision: "fp4"
+
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  ENABLE_EXPERT_PARALLEL: "1"
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  KVBM_CONTROL_METRICS: "true"
+  DYN_LOG: "error"
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4
+  # Decode plane: 2 AGGREGATED TEP=4 workers (4 GPU each), 1 worker/node => 2 nodes.
+  agg_nodes: 2
+  agg_workers: 2
+  gpus_per_agg: 4
+  # Hub-owned PREFILL ASIDE: 8 TP=1 workers, one worker per node => 8 nodes
+  # (each uses 1 of the node's 4 GPUs; full 235B on that GPU).
+  kvbm_prefill_nodes: 8
+  kvbm_prefill_tp: 1
+
+infra:
+  etcd_nats_dedicated_node: false       # co-locate etcd/nats + hub => 10 nodes total
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: "kv"
+    router-kv-events: true
+    router-min-initial-workers: 2       # = agg_workers (decode only; prefill invisible)
+
+backend:
+  type: vllm
+
+  kvbm_hub:
+    hub_binary: "/opt/kvbm/bin/kvbm_hub"
+    block_layout: universal             # ASYMMETRIC TP: decode TEP4 <-> prefill TP1
+    min_remote_prefill_tokens: 1024     # Conditional Threshold = 1024 tokens
+    host_cache_gb: 160.0                # PER-RANK (decode: 4 ranks/node = 640; prefill TP1: 1 rank/node = 160)
+    prefill_max_num_seqs: 8             # cap TP1 prefill in-flight (bounds activation mem; lightly loaded under CD)
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+      tensor-parallel-size: 4           # decode TEP=4 (prefill aside is TP=1, set via kvbm_prefill_tp)
+      enable-expert-parallel: true
+      # 0.95 (was 0.85): the TP=1 prefill holds the full 235B (~130 GiB) on one GPU; at
+      # 0.85 only 22.23 GiB was left for KV < the 23.5 GiB floor for one 262k-token seq
+      # (job 2185640 ValueError). 0.95 => ~46 GiB KV, clears the floor. (Applies to both
+      # decode TEP4 and the prefill aside, which reads this value.)
+      gpu-memory-utilization: 0.95
+      block-size: 64
+      max-model-len: 262144
+
+benchmark:
+  type: "trace-replay-sa"
+  public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
+  num_dataset_entries: 470           # full with-subagents 256k corpus (470 traces)
+  concurrencies: "48"
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 10
+  aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"
+  aiperf_args:
+    benchmark-duration: 1200
+    benchmark-grace-period: 30
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 120
+    export-http-trace: true

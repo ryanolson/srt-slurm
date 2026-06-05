@@ -8,7 +8,7 @@
 # Decode is AGGREGATED on purpose: `--disaggregation-mode decode` disables the
 # KV-event publisher, which blinds the router.
 #
-# Validated equivalent (hand-rolled harness): /lustre/fsw/core_dlfw_ci/ryan/stage2b_results.md
+# Validated equivalent (hand-rolled harness): /lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/docs/design/stage2b_results.md
 # Flip to 235B-A22B-NVFP4 TEP=4 by swapping model + tensor-parallel-size: 4 +
 # enable-expert-parallel: true (see commented block).
 
@@ -37,21 +37,23 @@ model:
   # The kvbm dev image (.sqsh). DEV variant: setup_script installs the wheels; the
   # hub binary runs from /workspace/target/release (mounted below). For a PRODUCTION
   # image, point this at kvbm-prod-<date>.sqsh (setup_script verify-no-ops).
-  container: "/lustre/fsw/core_dlfw_ci/ryan/kvbm.sqsh"
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm.sqsh"
   precision: "bf16"                  # Qwen3-32B native (235B-NVFP4 override: fp4)
 
 # Mount the dynamo repo (wheels for setup_script + the kvbm_hub/kvbmctl binaries +
-# start-hub.sh) at /workspace, and the project root at /models so the HF cache is
-# /models/hf_cache. List form (not a dict) avoids the show_config_details FormattablePath
-# display bug.
+# start-hub.sh) at /workspace, the workspace root at /models (so /models/harness +
+# /models/image resolve), and the SHARED hf_cache — which lives OUTSIDE the
+# workspace — at its own /hf_cache. List form (not a dict) avoids the
+# show_config_details FormattablePath display bug.
 extra_mount:
-  - "/lustre/fsw/core_dlfw_ci/ryan/dynamo:/workspace"
-  - "/lustre/fsw/core_dlfw_ci/ryan:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
 
 # Offline HF cache for every component (frontend resolves the tokenizer; decode +
 # prefill load weights). The prefill aside + decode + frontend all read these.
 environment:
-  HF_HOME: "/models/hf_cache"
+  HF_HOME: "/hf_cache"
   HF_HUB_OFFLINE: "1"
   # kvbm v2 connector rejects vllm > 0.19.999 unless bypassed (image ships 0.21.0).
   KVBM_SKIP_VLLM_VERSION_CHECK: "1"
@@ -62,18 +64,15 @@ environment:
   # 'UCX' not found". Pin it to the wheel's plugins (probed via /proc/maps on the
   # 260602 image; ldd-clean). Image-specific — re-probe if the image changes.
   NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
-  # CD observability metrics (Prometheus) — the durable, always-on channel for the
-  # local-vs-remote prefill decision counts, local/remote token sums + the remote
-  # distribution, and the decode<->prefill reconciliation. Lives in the
-  # kvbm-observability registry; independent of the DYN_LOG level below. Scrape
-  # http://<worker>:6880/metrics (or curl it once at benchmark end — counters are
-  # cumulative; histograms carry the distribution).
-  DYN_KVBM_METRICS: "1"
-  # NOTE: start_metrics_server binds a FIXED port per process. With >1 agg worker
-  # per node the 2nd worker's bind fails (NON-FATAL warn, no /metrics on it). For
-  # full per-worker coverage run 1 worker/node OR add a per-worker
-  # DYN_KVBM_METRICS_PORT offset in srtctl (follow-up).
-  DYN_KVBM_METRICS_PORT: "6880"
+  # CD observability metrics via the HUB PULL — NOT a per-worker /metrics axum.
+  # KVBM_CONTROL_METRICS=true registers each leader's control-plane MetricsModule;
+  # the hub aggregates them at  GET http://<hub>:<CONTROL_PORT>/v1/metrics  (velo
+  # fan-out). With the CD-snapshot-extended wheel/bins this carries the full
+  # kvbm_cd_* surface (decisions, token sums, the histograms, reconciliation) plus
+  # G2/G3 pool populations + in-flight sessions — so no leader hosts its own axum on
+  # a fixed port. (DYN_KVBM_METRICS, which would start that axum, is intentionally
+  # unset; that also sidesteps the >1-worker-per-node fixed-port bind clash.)
+  KVBM_CONTROL_METRICS: "true"
   # Logging: default ERROR, set on BOTH knobs together — DYN_LOG (dynamo frontend)
   # and RUST_LOG (kvbm connector/engine + kvbm_hub). The CD execution path still
   # emits per-request tracing::info! (decode_gnmt ~13, coordinator ~16) on top of

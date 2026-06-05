@@ -347,6 +347,12 @@ def show_config_details(config: SrtConfig) -> None:
             details.add_row("kvbm_hub", "features", kvbm_hub_cfg.features)
             details.add_row("kvbm_hub", "block_layout", kvbm_hub_cfg.block_layout)
             details.add_row("kvbm_hub", "min_remote_prefill_tokens", str(kvbm_hub_cfg.min_remote_prefill_tokens))
+            if kvbm_hub_cfg.max_inflight_remote_prefill_tokens is not None:
+                details.add_row(
+                    "kvbm_hub",
+                    "max_inflight_remote_prefill_tokens",
+                    f"{kvbm_hub_cfg.max_inflight_remote_prefill_tokens} (B-GNMT overflow armed)",
+                )
 
         console.print(Panel(details, border_style="blue"))
 

@@ -7,10 +7,12 @@ Benchmark stage mixin for SweepOrchestrator.
 Handles benchmark execution and profiling.
 """
 
+import json
 import logging
 import shlex
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,7 +21,14 @@ from srtctl.core.health import wait_for_model
 from srtctl.core.lockfile import collect_worker_fingerprints
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
-from srtctl.ports import FRONTEND_PUBLIC_PORT, SGLANG_HTTP_PORT_BASE
+from srtctl.ports import FRONTEND_PUBLIC_PORT, KVBM_HUB_CONTROL_PORT, SGLANG_HTTP_PORT_BASE
+
+# Filename for the post-benchmark KVBM metrics snapshot. MUST match
+# srtctl.analysis.bench_report.SNAPSHOT_FILENAME (the report reads it back).
+KVBM_METRICS_SNAPSHOT_FILENAME = "kvbm_metrics_snapshot.json"
+
+# Short per-GET timeout so a dead/absent hub can never delay teardown.
+_SNAPSHOT_HTTP_TIMEOUT_S = 2.0
 
 if TYPE_CHECKING:
     from srtctl.benchmarks.base import BenchmarkRunner
@@ -168,7 +177,119 @@ class BenchmarkStageMixin:
         else:
             logger.info("Benchmark completed successfully")
 
+        # Post-benchmark, PRE-teardown KVBM metrics snapshot. UNCONDITIONAL on
+        # exit_code so we capture CD state even on a failed run. Runs while the
+        # plane is still up (before do_sweep's finally: registry.cleanup()).
+        # Fully defensive: any error (no hub on agg runs, scrape timeout, bad
+        # JSON) is swallowed and NEVER fails or delays the benchmark.
+        self._snapshot_kvbm_metrics()
+
         return exit_code
+
+    def _snapshot_kvbm_metrics(self) -> None:
+        """Scrape the hub /v1/metrics fanout (+ per-decode-worker) before teardown.
+
+        Writes ``kvbm_metrics_snapshot.json`` into the run's real artifacts dir
+        (newest non-warmup ``*_sa_trace_c*`` dir under ``log_dir/artifacts``) if
+        resolvable, else the run ``log_dir`` — the same two locations
+        :func:`srtctl.analysis.bench_report.find_snapshot` searches, so the
+        report side can always find it.
+
+        Reuses the live_metrics never-fail / opt-in contract: the 8337 fanout
+        GET is NEW, e2e-unvalidated code — wrapped so a scrape error (or no hub,
+        e.g. on aggregated runs that never start a hub) is logged at DEBUG and
+        swallowed. Short per-GET timeout (~2s) so a dead hub can't delay
+        teardown. See docs/design/benchmark_report_design.md.
+        """
+        try:
+            # Opt-in: only attempt the hub scrape when the recipe stood up a hub.
+            hub_cfg = getattr(self.config.backend, "kvbm_hub", None)
+            snapshot: dict = {}
+
+            if hub_cfg is not None:
+                infra_ip = self.runtime.infra_node_ip
+                hub_url = f"http://{infra_ip}:{KVBM_HUB_CONTROL_PORT}/v1/metrics"
+                hub_data = self._http_get_json(hub_url)
+                if hub_data is not None:
+                    snapshot["hub_fanout"] = hub_data
+                    logger.info("KVBM metrics snapshot: scraped hub fanout %s", hub_url)
+                else:
+                    logger.debug("KVBM metrics snapshot: hub fanout %s returned nothing", hub_url)
+
+            # Per-decode-worker metrics (secondary). Best-effort; failures here
+            # must not affect the hub snapshot or the benchmark.
+            worker_metrics = self._scrape_decode_worker_metrics()
+            if worker_metrics:
+                snapshot["decode_workers"] = worker_metrics
+
+            if not snapshot:
+                logger.debug("KVBM metrics snapshot: nothing to write (no hub, no worker metrics)")
+                return
+
+            snapshot["_meta"] = {
+                "job_id": self.runtime.job_id,
+                "hub_present": hub_cfg is not None,
+                "infra_node_ip": getattr(self.runtime, "infra_node_ip", None),
+            }
+
+            out_dir = self._resolve_artifacts_dir()
+            out_path = out_dir / KVBM_METRICS_SNAPSHOT_FILENAME
+            out_path.write_text(json.dumps(snapshot, indent=2))
+            logger.info("Wrote KVBM metrics snapshot: %s", out_path)
+        except Exception as e:  # never let the snapshot affect the benchmark
+            logger.debug("KVBM metrics snapshot skipped: %s", e)
+
+    def _http_get_json(self, url: str) -> object | None:
+        """GET a URL with a short timeout, parse JSON. Returns None on any error."""
+        try:
+            with urllib.request.urlopen(url, timeout=_SNAPSHOT_HTTP_TIMEOUT_S) as resp:  # noqa: S310
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:  # noqa: BLE001 - best-effort scrape
+            logger.debug("KVBM metrics snapshot: GET %s failed: %s", url, e)
+            return None
+
+    def _scrape_decode_worker_metrics(self) -> dict[str, str]:
+        """Best-effort GET of each decode/agg leader's Prometheus /metrics text.
+
+        Returns a {url: raw_text} map. Per-worker failures are swallowed; the
+        whole method never raises. Secondary to the hub fanout.
+        """
+        out: dict[str, str] = {}
+        try:
+            for process in self.backend_processes:
+                if not process.is_leader or process.endpoint_mode not in ("decode", "agg"):
+                    continue
+                if process.sys_port <= 0:
+                    continue
+                host = get_hostname_ip(process.node, self.runtime.network_interface)
+                url = f"http://{host}:{process.sys_port}/metrics"
+                try:
+                    with urllib.request.urlopen(url, timeout=_SNAPSHOT_HTTP_TIMEOUT_S) as resp:  # noqa: S310
+                        out[url] = resp.read().decode("utf-8", errors="replace")
+                except Exception as e:  # noqa: BLE001 - per-worker best-effort
+                    logger.debug("KVBM metrics snapshot: worker GET %s failed: %s", url, e)
+        except Exception as e:  # noqa: BLE001 - never raise out of the snapshot path
+            logger.debug("KVBM metrics snapshot: worker scrape skipped: %s", e)
+        return out
+
+    def _resolve_artifacts_dir(self) -> Path:
+        """Resolve the run's real artifacts dir, or fall back to log_dir.
+
+        SHARED CONTRACT with bench_report.find_snapshot: write into the newest
+        non-warmup ``*_sa_trace_c*`` dir under ``log_dir/artifacts`` when present
+        (so the snapshot sits beside the aiperf exports), else ``log_dir``.
+        """
+        artifacts = self.runtime.log_dir / "artifacts"
+        try:
+            if artifacts.is_dir():
+                candidates = [
+                    d for d in artifacts.iterdir() if d.is_dir() and d.name != "warmup" and "sa_trace_c" in d.name
+                ]
+                if candidates:
+                    return sorted(candidates, key=lambda d: d.stat().st_mtime)[-1]
+        except Exception as e:  # noqa: BLE001 - fall back to log_dir
+            logger.debug("KVBM metrics snapshot: artifacts dir resolve failed: %s", e)
+        return self.runtime.log_dir
 
     def _run_benchmark_script(
         self,

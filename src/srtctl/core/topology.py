@@ -416,6 +416,143 @@ def allocate_endpoints(
     return endpoints
 
 
+@dataclass(frozen=True)
+class AsidePlacement:
+    """Placement for one hub-owned prefill ASIDE worker.
+
+    The aside is launched outside the dynamo endpoint topology (do_sweep.
+    start_kvbm_prefill_workers), so it does not flow through
+    ``endpoints_to_processes``. This dataclass captures where it lands.
+
+    Attributes:
+        node: The node hostname the aside worker runs on.
+        gpu_indices: GPU indices the aside uses on that node. When the aside
+            co-locates on a partially-filled endpoint node, these are the FREE
+            indices the dynamo endpoints did not take; when it owns a whole node
+            this is the full ``range(gpus_per_node)``.
+        colocated: True when the aside shares a node with a dynamo endpoint
+            (carved from that node's free GPUs). False when it owns the node.
+    """
+
+    node: str
+    gpu_indices: frozenset[int]
+    colocated: bool = False
+
+    @property
+    def cuda_visible_devices(self) -> str:
+        """CUDA_VISIBLE_DEVICES string for this aside worker."""
+        return ",".join(str(i) for i in sorted(self.gpu_indices))
+
+
+def compute_aside_placement(
+    *,
+    endpoints: Sequence[Endpoint],
+    num_workers: int,
+    gpus_per_worker: int,
+    gpus_per_node: int,
+    available_nodes: Sequence[str],
+    infra_node: str | None = None,
+    colocate: bool = False,
+) -> list[AsidePlacement]:
+    """Place ``num_workers`` hub-owned prefill ASIDE workers onto nodes.
+
+    Single source of truth for the aside carve-out: ``Config.total_nodes``
+    calls this (on synthetic nodes) to size the SLURM allocation, and
+    ``do_sweep.start_kvbm_prefill_workers`` calls it (on the real nodelist) to
+    launch the workers — so the predicted node count and the runtime placement
+    can never diverge.
+
+    Two modes:
+        colocate=False (default, byte-identical to the original carve-out):
+            each aside worker takes a whole node the dynamo endpoints did NOT
+            use (and != infra_node), using all of that node's GPUs.
+        colocate=True:
+            an aside worker first fills the FREE GPUs on a partially-occupied
+            endpoint node (a node already used by a dynamo endpoint but with
+            >= gpus_per_worker idle GPUs, and != infra_node), assigning it those
+            free GPU indices. Workers that don't fit on a partial node fall back
+            to a wholly-free node. This lets the CD prefill aside share the
+            "+1" decode node's idle GPUs instead of taking a 4th node.
+
+    Args:
+        endpoints: The dynamo endpoint allocation (decode/agg/prefill).
+        num_workers: Number of aside workers to place.
+        gpus_per_worker: GPUs per aside worker (kvbm_prefill_tp).
+        gpus_per_node: GPUs per node in the cluster.
+        available_nodes: Ordered worker nodelist.
+        infra_node: Node hosting etcd/nats/hub; never used by the aside.
+        colocate: Enable carving from partially-filled endpoint nodes.
+
+    Returns:
+        List of AsidePlacement, one per aside worker.
+
+    Raises:
+        ValueError: when there is not enough room for ``num_workers`` asides.
+    """
+    if num_workers <= 0:
+        return []
+    if gpus_per_worker <= 0:
+        raise ValueError(f"gpus_per_worker must be positive, got {gpus_per_worker}")
+
+    # GPUs each node already gives to dynamo endpoints.
+    used_gpus: dict[str, set[int]] = {}
+    for ep in endpoints:
+        for node in ep.nodes:
+            used_gpus.setdefault(node, set()).update(ep.gpu_indices)
+
+    # Track GPUs the aside itself has consumed so multiple asides on one node
+    # don't overlap each other.
+    aside_gpus: dict[str, set[int]] = {}
+
+    def free_indices(node: str) -> list[int]:
+        taken = used_gpus.get(node, set()) | aside_gpus.get(node, set())
+        return [g for g in range(gpus_per_node) if g not in taken]
+
+    placements: list[AsidePlacement] = []
+    for _ in range(num_workers):
+        chosen_node: str | None = None
+        chosen_gpus: frozenset[int] | None = None
+        colocated = False
+
+        if colocate:
+            # Prefer a node already used by an endpoint with enough idle GPUs.
+            for node in available_nodes:
+                if node == infra_node or node not in used_gpus:
+                    continue
+                free = free_indices(node)
+                if len(free) >= gpus_per_worker:
+                    chosen_node = node
+                    chosen_gpus = frozenset(free[:gpus_per_worker])
+                    colocated = True
+                    break
+
+        if chosen_node is None:
+            # Fall back to a wholly-free node (the default behavior).
+            for node in available_nodes:
+                if node == infra_node or node in used_gpus:
+                    continue
+                free = free_indices(node)
+                if len(free) >= gpus_per_worker:
+                    chosen_node = node
+                    chosen_gpus = frozenset(free[:gpus_per_worker])
+                    break
+
+        if chosen_node is None or chosen_gpus is None:
+            raise ValueError(
+                f"Cannot place {num_workers} kvbm prefill aside worker(s) of {gpus_per_worker} GPU(s) each: "
+                f"no node with {gpus_per_worker} free GPU(s) available "
+                f"(colocate={colocate}, nodes={list(available_nodes)})."
+            )
+
+        aside_gpus.setdefault(chosen_node, set()).update(chosen_gpus)
+        # Mark colocated asides as occupying that node so a later wholly-free
+        # search doesn't re-pick it as "unused".
+        used_gpus.setdefault(chosen_node, set())
+        placements.append(AsidePlacement(node=chosen_node, gpu_indices=chosen_gpus, colocated=colocated))
+
+    return placements
+
+
 def allocate_endpoints_het(
     *,
     num_prefill: int,

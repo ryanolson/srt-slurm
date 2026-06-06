@@ -45,7 +45,13 @@ from srtctl.core.runtime import RuntimeContext
 from srtctl.core.schema import SrtConfig
 from srtctl.core.slurm import get_slurm_job_id, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
-from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
+from srtctl.core.topology import (
+    Endpoint,
+    NodePortAllocator,
+    Process,
+    allocate_endpoints_het,
+    compute_aside_placement,
+)
 from srtctl.logging_utils import setup_logging
 from srtctl.ports import (
     ETCD_CLIENT_PORT,
@@ -53,9 +59,11 @@ from srtctl.ports import (
     KVBM_HUB_CONTROL_PORT,
     KVBM_HUB_DISCOVERY_PORT,
     KVBM_HUB_VELO_PORT,
+    KVBM_ZMQ_PORT_BASE,
     MOONCAKE_HTTP_METADATA_PORT,
     MOONCAKE_MASTER_PORT,
     NATS_PORT,
+    VLLM_NIXL_PORT_BASE,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,18 +111,29 @@ def build_kvbm_hub_command(
 
     command = [
         hub_cfg.hub_binary,
-        "--discovery-port", str(discovery_port),
-        "--control-port", str(control_port),
-        "--velo-port", str(velo_port),
-        "--heartbeat-interval-secs", "10",
-        "--block-size", str(block_size),
-        "--max-seq-len", str(max_seq_len),
-        "--layout", hub_cfg.block_layout,
-        "--kv-index-advertise-host", infra_node,
-        "--features", hub_cfg.features,
-        "--g2-memory", str(int(hub_cfg.host_cache_gb)),
+        "--discovery-port",
+        str(discovery_port),
+        "--control-port",
+        str(control_port),
+        "--velo-port",
+        str(velo_port),
+        "--heartbeat-interval-secs",
+        "10",
+        "--block-size",
+        str(block_size),
+        "--max-seq-len",
+        str(max_seq_len),
+        "--layout",
+        hub_cfg.block_layout,
+        "--kv-index-advertise-host",
+        infra_node,
+        "--features",
+        hub_cfg.features,
+        "--g2-memory",
+        str(int(hub_cfg.host_cache_gb)),
         "--prefill-router",
-        "--prefill-worker-concurrency", "4",
+        "--prefill-worker-concurrency",
+        "4",
     ]
 
     # CD circuit breaker: master enable + watermark/debounce flags, emitted ONLY
@@ -414,37 +433,54 @@ class SweepOrchestrator(
         endpoint topology. These workers join the kvbm_hub prefill-router velo
         fleet and never register to dynamo/etcd, so the frontend/router ignore them.
 
-        Phase-2 scope: one worker per node at kvbm_prefill_tp == gpus_per_node
-        (multi-node TP / intra-node GPU packing is a follow-up).
+        By default each aside takes its own whole node. With
+        ``resources.kvbm_prefill_colocate`` the aside may instead carve the FREE
+        GPUs of a partially-filled endpoint node (e.g. the "+1" decode node in a
+        bin-packed CD plane), saving the extra node. Placement is computed by the
+        shared ``compute_aside_placement`` helper — the same one ``Config.
+        total_nodes`` uses to size the SLURM allocation — so the two cannot diverge.
         """
         backend = self.config.backend
         if not isinstance(backend, VLLMProtocol) or backend.kvbm_hub is None:
             return []
-        n_prefill = self.config.resources.kvbm_prefill_nodes or 0
+        r = self.config.resources
+        n_prefill = r.kvbm_prefill_nodes or 0
         if n_prefill <= 0:
             return []
 
-        # Carve the worker nodes the dynamo (agg/decode) endpoints did NOT take.
-        used: set[str] = set()
-        for ep in self.endpoints:
-            used.update(ep.nodes)
-        free = [n for n in self.runtime.nodes.worker if n not in used and n != self.runtime.nodes.infra]
-        if len(free) < n_prefill:
-            raise RuntimeError(
-                f"kvbm_prefill needs {n_prefill} free node(s) but only {len(free)} are unused by the "
-                f"dynamo plane ({free}). Ensure resources.kvbm_prefill_nodes is added on top of the "
-                f"agg/decode node count (it folds into total_nodes)."
+        tp = r.kvbm_prefill_tp or self.runtime.gpus_per_node
+        try:
+            placements = compute_aside_placement(
+                endpoints=self.endpoints,
+                num_workers=n_prefill,
+                gpus_per_worker=tp,
+                gpus_per_node=self.runtime.gpus_per_node,
+                available_nodes=self.runtime.nodes.worker,
+                infra_node=self.runtime.nodes.infra,
+                colocate=r.kvbm_prefill_colocate,
             )
-        prefill_nodes = free[:n_prefill]
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{exc} Ensure resources.kvbm_prefill_nodes is reserved on top of the agg/decode "
+                f"node count (it folds into total_nodes), or set resources.kvbm_prefill_colocate "
+                f"to share a partially-filled endpoint node's idle GPUs."
+            ) from exc
 
-        tp = self.config.resources.kvbm_prefill_tp or self.runtime.gpus_per_node
         hub_url = f"http://{self.runtime.nodes.infra}:{KVBM_HUB_DISCOVERY_PORT}"
         # The prefill aside runs `python -m kvbm.vllm.prefill`, so it needs the kvbm
         # wheel in the venv. It bypasses the standard worker stage, so apply the SAME
         # preamble (setup_script wheel install) the decode workers + frontend get.
         preamble = self._build_worker_preamble()
+        # Port deconfliction for co-located asides: the endpoint processes were
+        # assigned NIXL / kv-events / DYN_KVBM_LEADER_ZMQ ports from the per-job
+        # global sequences (NodePortAllocator). Continue those sequences PAST the
+        # last endpoint process so a co-located aside never collides with the
+        # endpoint worker sharing its node. (When the aside owns a whole node this
+        # is harmless — the ports are simply unique.)
+        n_endpoint_procs = len(self.backend_processes)
         managed_list: list[ManagedProcess] = []
-        for i, node in enumerate(prefill_nodes):
+        for i, placement in enumerate(placements):
+            node = placement.node
             log = self.runtime.log_dir / f"{node}_kvbm_prefill_w{i}.out"
             cmd = backend.build_kvbm_prefill_command(self.runtime, tp, hub_url)
             # The aside bypasses the standard worker env path, so seed it with the
@@ -456,7 +492,34 @@ class SweepOrchestrator(
             env_to_set["HF_HUB_OFFLINE"] = "1"
             if backend.kvbm_hub.env:
                 env_to_set.update(backend.kvbm_hub.env)
-            logger.info("Starting kvbm_prefill worker %d on %s (tp=%d, hub=%s)", i, node, tp, hub_url)
+            # Only a CO-LOCATED aside needs explicit GPU + port pinning. When it
+            # owns a whole node (the default carve-out) it is alone on indices
+            # {0..tp-1} with default ports — exactly vLLM's defaults — so we set
+            # NOTHING, keeping every non-colocate recipe byte-identical.
+            if placement.colocated:
+                # Pin the aside to the partial node's FREE GPUs so it never
+                # overlaps the endpoint worker's CUDA_VISIBLE_DEVICES.
+                env_to_set["CUDA_VISIBLE_DEVICES"] = placement.cuda_visible_devices
+                # Deconflict the aside's bound TCP ports against every endpoint
+                # worker by extending the per-job allocator sequence (offset is
+                # unique per aside and strictly beyond the endpoint range): the
+                # NIXL side channel + the DYN_KVBM_LEADER_ZMQ pub/ack pair the
+                # in-process consolidator binds.
+                port_offset = n_endpoint_procs + i
+                env_to_set["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(VLLM_NIXL_PORT_BASE + port_offset)
+                zmq_pub = KVBM_ZMQ_PORT_BASE + (port_offset * 2)
+                if zmq_pub + 1 <= 65535:
+                    env_to_set["DYN_KVBM_LEADER_ZMQ_PUB_PORT"] = str(zmq_pub)
+                    env_to_set["DYN_KVBM_LEADER_ZMQ_ACK_PORT"] = str(zmq_pub + 1)
+            logger.info(
+                "Starting kvbm_prefill worker %d on %s (tp=%d, gpus=%s, colocated=%s, hub=%s)",
+                i,
+                node,
+                tp,
+                placement.cuda_visible_devices,
+                placement.colocated,
+                hub_url,
+            )
             proc = start_srun_process(
                 command=cmd,
                 nodelist=[node],

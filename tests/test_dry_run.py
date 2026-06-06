@@ -735,3 +735,220 @@ class TestDryRunHetJobs:
         output = capsys.readouterr().out
         assert "Heterogeneous Job" in output
         assert "first node" in output  # infra note on the prefill row
+
+
+def _binpack_placement(config):
+    """Mirror do_sweep's endpoint + aside placement for a non-het vLLM config.
+
+    Returns (total_nodes, list[(label, node, gpu_indices, ports_dict)]) where
+    ports_dict holds the TCP ports each process binds (nixl/kv/zmq). Used to
+    assert per-node GPU + port disjointness at the object level (dry-run does
+    not print per-worker GPU/port assignments, and the aside is carved at
+    runtime in do_sweep, so this is the only place to verify them).
+    """
+    from srtctl.core.topology import (
+        NodePortAllocator,
+        compute_aside_placement,
+        endpoints_to_processes,
+    )
+    from srtctl.ports import KVBM_ZMQ_PORT_BASE, VLLM_NIXL_PORT_BASE
+
+    r = config.resources
+    backend = config.backend
+    # backend.allocate_endpoints internally applies should_colocate_prefill_decode.
+    nodes = tuple(f"node{i}" for i in range(config.total_nodes))
+    eps = backend.allocate_endpoints(
+        num_prefill=r.num_prefill,
+        num_decode=r.num_decode,
+        num_agg=r.num_agg,
+        gpus_per_prefill=r.gpus_per_prefill,
+        gpus_per_decode=r.gpus_per_decode,
+        gpus_per_agg=r.gpus_per_agg,
+        gpus_per_node=r.gpus_per_node,
+        available_nodes=nodes,
+        spread_workers=r.spread_workers,
+    )
+    procs = endpoints_to_processes(eps, port_allocator=NodePortAllocator())
+    placement = []
+    for p in procs:
+        env = backend.get_process_environment(p)
+        ports = {"nixl": p.nixl_port, "kv": p.kv_events_port}
+        if "DYN_KVBM_LEADER_ZMQ_PUB_PORT" in env:
+            ports["zmq_pub"] = int(env["DYN_KVBM_LEADER_ZMQ_PUB_PORT"])
+            ports["zmq_ack"] = int(env["DYN_KVBM_LEADER_ZMQ_ACK_PORT"])
+        placement.append((f"{p.endpoint_mode}{p.endpoint_index}", p.node, frozenset(p.gpu_indices), ports))
+
+    n_aside = r.kvbm_prefill_nodes or 0
+    if n_aside and backend.kvbm_hub is not None:
+        tp = r.kvbm_prefill_tp or r.gpus_per_node
+        infra = None if config.infra.etcd_nats_dedicated_node else nodes[0]
+        asides = compute_aside_placement(
+            endpoints=eps,
+            num_workers=n_aside,
+            gpus_per_worker=tp,
+            gpus_per_node=r.gpus_per_node,
+            available_nodes=nodes,
+            infra_node=infra,
+            colocate=r.kvbm_prefill_colocate,
+        )
+        n_ep = len(procs)
+        for i, pl in enumerate(asides):
+            # Mirror do_sweep: only a CO-LOCATED aside gets explicit ports.
+            if pl.colocated:
+                off = n_ep + i
+                ports = {
+                    "nixl": VLLM_NIXL_PORT_BASE + off,
+                    "zmq_pub": KVBM_ZMQ_PORT_BASE + off * 2,
+                    "zmq_ack": KVBM_ZMQ_PORT_BASE + off * 2 + 1,
+                }
+            else:
+                ports = {}
+            placement.append((f"aside{i}", pl.node, pl.gpu_indices, ports))
+
+    return config.total_nodes, placement
+
+
+def _assert_2_workers_per_node_distinct(total_nodes, placement, gpus_per_node):
+    """All workers pack 2/node; per-node GPUs and ports are disjoint."""
+    by_node: dict[str, list] = {}
+    for label, node, gpus, ports in placement:
+        by_node.setdefault(node, []).append((label, gpus, ports))
+
+    assert len(by_node) == total_nodes
+    for node, items in by_node.items():
+        # GPU disjointness
+        seen_gpus: set[int] = set()
+        for _label, gpus, _ports in items:
+            assert seen_gpus.isdisjoint(gpus), f"GPU overlap on {node}"
+            seen_gpus |= set(gpus)
+        # 2 workers/node => 4 GPUs used on a 4-GPU node
+        assert len(items) == 2, f"{node} has {len(items)} workers, expected 2"
+        assert len(seen_gpus) == gpus_per_node
+        # Port disjointness
+        seen_ports: set[int] = set()
+        for _label, _gpus, ports in items:
+            for port in ports.values():
+                if port is None:
+                    continue
+                assert port not in seen_ports, f"port {port} collision on {node}"
+                seen_ports.add(port)
+
+
+# Recipe-shaped resource blocks (mirror the SOP binpack120 recipes; gb200 4-GPU nodes).
+_CD_RESOURCES = {
+    "gpu_type": "gb200",
+    "gpus_per_node": 4,
+    "agg_nodes": 3,
+    "agg_workers": 5,
+    "gpus_per_agg": 2,
+    "kvbm_prefill_nodes": 1,
+    "kvbm_prefill_tp": 2,
+    "prefill_nodes": None,
+    "decode_nodes": None,
+    "prefill_workers": None,
+    "decode_workers": None,
+}
+
+_TRAD_RESOURCES = {
+    "gpu_type": "gb200",
+    "gpus_per_node": 4,
+    "prefill_nodes": 2,
+    "prefill_workers": 3,
+    "gpus_per_prefill": 2,
+    "decode_nodes": 2,
+    "decode_workers": 3,
+    "gpus_per_decode": 2,
+}
+
+
+class TestBinpack3Node:
+    """CD (prefill-aside co-location) and TRAD (P/D co-location) bin-pack to a
+    TRUE 3 nodes (12 GPUs, 2 workers/node) with distinct GPUs + no port
+    collisions; AGG and the default-off paths are unchanged."""
+
+    def test_cd_aside_colocate_packs_to_three_nodes(self):
+        config = _make_config(
+            {
+                "resources": {**_CD_RESOURCES, "kvbm_prefill_colocate": True},
+                "backend": {"type": "vllm", "kvbm_hub": {}},
+                "infra": {"etcd_nats_dedicated_node": False},
+            }
+        )
+        assert config.total_nodes == 3
+        total_nodes, placement = _binpack_placement(config)
+        assert total_nodes == 3
+        _assert_2_workers_per_node_distinct(total_nodes, placement, gpus_per_node=4)
+
+        # The aside co-locates on the partial decode node (the 5th agg leaves 2
+        # idle GPUs there) and is carved its FREE indices, not the agg's.
+        aside = next(p for p in placement if p[0] == "aside0")
+        agg_on_aside_node = [p for p in placement if p[1] == aside[1] and p[0] != "aside0"]
+        assert len(agg_on_aside_node) == 1  # exactly one agg shares the aside node
+        assert aside[2].isdisjoint(agg_on_aside_node[0][2])  # distinct GPUs
+
+    def test_cd_aside_default_off_reserves_extra_node(self):
+        """Without kvbm_prefill_colocate the CD aside still takes its own node
+        (4 nodes) — byte-identical to the historical carve-out."""
+        config = _make_config(
+            {
+                "resources": {**_CD_RESOURCES},  # colocate defaults False
+                "backend": {"type": "vllm", "kvbm_hub": {}},
+                "infra": {"etcd_nats_dedicated_node": False},
+            }
+        )
+        assert config.resources.kvbm_prefill_colocate is False
+        assert config.total_nodes == 4  # agg_nodes(3) + kvbm_prefill_nodes(1)
+
+    def test_trad_pd_colocate_packs_to_three_nodes(self):
+        config = _make_config(
+            {
+                "resources": {**_TRAD_RESOURCES},
+                "backend": {"type": "vllm", "allow_prefill_decode_colocation": True, "connector": "nixl"},
+                "infra": {"etcd_nats_dedicated_node": False},
+            }
+        )
+        assert config.total_nodes == 3
+        total_nodes, placement = _binpack_placement(config)
+        assert total_nodes == 3
+        _assert_2_workers_per_node_distinct(total_nodes, placement, gpus_per_node=4)
+
+        # Exactly one node mixes a prefill and a decode worker (n1).
+        by_node: dict[str, set] = {}
+        for label, node, _gpus, _ports in placement:
+            by_node.setdefault(node, set()).add(label[:-1])  # strip index
+        mixed = [n for n, modes in by_node.items() if modes == {"prefill", "decode"}]
+        assert len(mixed) == 1
+
+    def test_trad_default_off_keeps_four_nodes(self):
+        """Without allow_prefill_decode_colocation, 3P+3D stays on 4 nodes
+        (2 prefill + 2 decode) — unrelated trad recipes unchanged."""
+        config = _make_config(
+            {
+                "resources": {**_TRAD_RESOURCES},
+                "backend": {"type": "vllm", "connector": "nixl"},
+            }
+        )
+        assert config.total_nodes == 4
+
+    def test_agg_unchanged_three_nodes(self):
+        """The aggregated baseline (6 TEP=2 agg workers, no aside, no P/D
+        colocation) packs 2/node onto 3 nodes — unaffected by either change."""
+        config = _make_config(
+            {
+                "resources": {
+                    "gpu_type": "gb200",
+                    "gpus_per_node": 4,
+                    "agg_nodes": 3,
+                    "agg_workers": 6,
+                    "gpus_per_agg": 2,
+                    "prefill_nodes": None,
+                    "decode_nodes": None,
+                    "prefill_workers": None,
+                    "decode_workers": None,
+                },
+                "backend": {"type": "vllm", "connector": "nixl"},
+            }
+        )
+        assert config.total_nodes == 3
+        total_nodes, placement = _binpack_placement(config)
+        _assert_2_workers_per_node_distinct(total_nodes, placement, gpus_per_node=4)

@@ -1,0 +1,155 @@
+# EXPERIMENT cd-G binpack@120 — 5d+1p TEP2, threshold 4096, CIRCUIT BREAKER ENABLED,
+# BIN-PACKED 2 decode/node, KVBM G2 host cache dropped 160 -> 120 GB/RANK.
+#
+# STRATEGY A (per user 2026-06-05): collapse the 6-node SPREAD CD footprint to a 4-node
+# BIN-PACKED one by packing 2 TEP=2 decode-AGG workers (4 GPUs) per GB200 node, made STABLE
+# by dropping the per-rank KVBM G2 host cache from 160 -> 120 GB.
+#
+# WHY 120 IS THE FIX (OOM root-cause, budget proof):
+#   The 160-GB bin-pack (cd-G, job 2187916) OOM-killed: 2 decode/node x 2 ranks/worker = 4
+#   ranks/node, each pinning host_cache_gb * 0.931 GiB => 4 x (160 x 0.931 = 149 GiB) = 596
+#   GiB pinned/node, leaving only ~294 GiB headroom under the 890.4 GiB cgroup host-mem cap —
+#   and the decode head node ALSO carries hub + etcd/nats, so it tipped over (killed at c80/c96).
+#   At 120 GB/rank: 4 x (120 x 0.931 = 112 GiB) = 447 GiB pinned/node => ~443 GiB headroom,
+#   which absorbs the co-located hub/etcd/nats + process/activation overhead. GPU is NOT the
+#   constraint (gpu-memory-utilization stays 0.85 — same as the OOM'd run).
+#
+# TOPOLOGY (4 GB200 nodes, NOT 3):
+#   Decode plane: 5 AGGREGATED TEP=2 workers (2 GPUs each), bin-packed 2/node (spread_workers
+#   omitted => default false) => 3 decode nodes (2 + 2 + 1; the 3rd node has 2 idle GPUs).
+#   Hub-owned PREFILL ASIDE: 1 TEP=2 worker. The aside is placed by do_sweep.start_kvbm_prefill_
+#   workers onto a node NOT used by any dynamo endpoint and != the infra node; the partial
+#   decode node (the "+1") is already used by a decode endpoint, so the aside CANNOT co-locate
+#   there and takes its own node => 1 prefill node. total_nodes = agg_nodes(3) + kvbm_prefill_
+#   nodes(1) = 4 => --nodes=4, --segment=4. (3 nodes would require editing the prefill carve-out
+#   to share the partial decode node's idle GPUs — out of scope for a recipe-only change. 4 is
+#   still a 33% node saving vs the 6-node SPREAD cd-G.)
+#   agg_nodes=3 is REQUIRED (not arbitrary): it gives the decode plane its 3 bin-packed nodes
+#   and leaves the 4th free for the prefill carve-out; agg_nodes=2 would starve the aside
+#   (free=[] => runtime RuntimeError).
+#
+# Everything else mirrors cd-G: circuit breaker armed (router-sourced 3-tier, replaces the
+# static B-GNMT max_inflight budget), threshold 4096, co-located infra (etcd_nats_dedicated_
+# node: false). Correct dataset (with_subagents_256k/470). Image kvbm-prod-260607.sqsh.
+# Benchmark concurrency 80 (matching the OOM ramp point we want to prove stable at 120).
+
+name: "kvbm-cdg-5d1p-binpack120-c96"
+
+identity:
+  model:
+    repo: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+    revision: "1c4ec35802abf3a20672be7e5c51a098796f71d6"
+  container:
+    image: "nvcr.io/nvidian/dynamo-dev/ryan:kvbm-vllm-dev-260602"
+  frameworks:
+    dynamo: "1.2.0"
+    vllm: "0.21.0"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  time_limit: "01:45:00"
+
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260607.sqsh"  # FP8 + B-GNMT + breaker + CD token-load metrics (Q7 prefill local-hit)
+  precision: "fp4"
+
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  ENABLE_EXPERT_PARALLEL: "1"
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  KVBM_CONTROL_METRICS: "true"        # hub control /v1/metrics fanout — the snapshot hook scrapes this
+  DYN_LOG: "error"                    # breaker metrics are Prometheus (log-independent); no need to raise
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4
+  # Decode plane: 5 AGGREGATED TEP=2 workers (2 GPU each), BIN-PACKED 2/node (spread_workers
+  # omitted => default false) => 3 decode nodes (2 + 2 + 1). At host_cache_gb=120/rank this is
+  # 4 ranks/node x 112 GiB = 447 GiB pinned/node (worst case, the 2-worker nodes), ~443 GiB
+  # headroom under the 890.4 GiB cap (vs the 596 GiB / ~294 GiB that OOM'd at 160 — see header).
+  agg_nodes: 3
+  agg_workers: 5
+  gpus_per_agg: 2
+  # NO spread_workers => bin-pack 2 workers (4 GPUs)/node.
+  # Hub-owned PREFILL ASIDE: 1 TEP=2 worker => its own node (cannot co-locate on the partial
+  # decode node — that node is already used by a decode endpoint). total_nodes = 3 + 1 = 4.
+  kvbm_prefill_nodes: 1
+  kvbm_prefill_tp: 2
+  # CO-LOCATE the 1 TEP=2 prefill aside on the partial decode node's 2 idle GPUs
+  # (5 decode-AGG @ 2/node => n2 has GPUs 2,3 free) instead of taking a 4th node.
+  # => total_nodes = 3 (was 4). Aside gets CUDA_VISIBLE_DEVICES=2,3 + deconflicted ports.
+  kvbm_prefill_colocate: true
+
+infra:
+  etcd_nats_dedicated_node: false       # co-locate etcd/nats + hub (on a decode node)
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    router-mode: "kv"
+    router-kv-events: true
+    router-min-initial-workers: 5       # = agg_workers (decode only)
+
+backend:
+  type: vllm
+
+  kvbm_hub:
+    hub_binary: "/opt/kvbm/bin/kvbm_hub"
+    block_layout: operational           # symmetric TP (decode TEP2 == prefill TEP2)
+    min_remote_prefill_tokens: 4096     # Conditional Threshold = 4096 (NEW DEFAULT; throughput-neutral
+                                        # per the §7 sweep, fewer/larger remote prefills, gentler on the breaker)
+    # CIRCUIT BREAKER (router-sourced 3-tier; replaces the static B-GNMT max_inflight budget):
+    cd_breaker_enabled: true
+    cd_breaker_warm_high: 0.5           # trip CALM->WARM when prefill free-capacity-fraction < 0.5
+    cd_breaker_hot_high: 0.15           # trip WARM->HOT (coarse downgrade-all) when free-frac < 0.15
+    cd_breaker_clear_low: 0.7           # clear (step down) only when free-frac recovers > 0.7 (gap => no flap)
+    cd_breaker_clear_debounce_ticks: 3  # N consecutive recovered ticks before stepping down
+    host_cache_gb: 120.0                # PER-RANK — dropped 160 -> 120 to fit the 4-rank/node bin-pack (see header)
+    prefill_max_num_seqs: 8             # cap the single prefill aside's in-flight requests
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+      tensor-parallel-size: 2           # TEP=2
+      enable-expert-parallel: true
+      gpu-memory-utilization: 0.85
+      block-size: 64
+      max-model-len: 262144
+
+benchmark:
+  type: "trace-replay-sa"
+  public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
+  num_dataset_entries: 470           # full with-subagents 256k corpus (470 traces)
+  concurrencies: "96"
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 10
+  aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"
+  aiperf_args:
+    benchmark-duration: 1200
+    benchmark-grace-period: 30
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 120
+    export-http-trace: true

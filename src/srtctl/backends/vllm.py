@@ -116,7 +116,7 @@ class KvbmHubConfig:
     cd_breaker_clear_debounce_ticks: int | None = None
     host_cache_gb: float = 100.0
     prefill_max_num_seqs: int | None = None  # cap the prefill aside's in-flight requests (vLLM --max-num-seqs)
-    remote_search: bool = True          # decode: remote-search ON by default
+    remote_search: bool = True  # decode: remote-search ON by default
     remote_search_prefill: bool = False  # prefill: OFF by default (pure CD target; no indexer)
     onboard_mode: str = "inter"
     connector_module_path: str = "kvbm.v2.vllm.connector"
@@ -418,14 +418,25 @@ class VLLMProtocol:
         gpus_per_agg: int,
         gpus_per_node: int,
     ) -> bool:
-        """Whether all vLLM workers should be packed onto one node."""
+        """Whether prefill and decode workers may share nodes (bin-pack P/D).
+
+        Gated on the opt-in ``allow_prefill_decode_colocation`` flag (off by
+        default => byte-identical to the historical P/D node separation). Once
+        opted in, the only hardware requirement is that each INDIVIDUAL worker
+        fits on a node — the allocator then bin-packs P and D into the same
+        node's GPU slots (each worker still gets its own distinct GPUs). The
+        resulting node count is derived from the actual allocation in
+        ``Config.total_nodes``, so this no longer needs the conservative
+        "all workers fit one node" cap that prevented e.g. 3P+3D TEP=2 from
+        packing 2 workers/node onto 3 nodes (12 GPUs > gpus_per_node=4).
+        """
         if not self.allow_prefill_decode_colocation:
             return False
         if num_prefill <= 0 or num_decode <= 0 or gpus_per_node <= 0:
             return False
 
-        total_worker_gpus = num_prefill * gpus_per_prefill + num_decode * gpus_per_decode + num_agg * gpus_per_agg
-        return total_worker_gpus <= gpus_per_node
+        # Each worker must individually fit within a single node.
+        return gpus_per_prefill <= gpus_per_node and gpus_per_decode <= gpus_per_node
 
     def allocate_endpoints(
         self,

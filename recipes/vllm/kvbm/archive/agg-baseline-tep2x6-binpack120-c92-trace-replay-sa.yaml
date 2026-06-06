@@ -1,0 +1,138 @@
+# EXPERIMENT agg baseline (TEP=2, BIN-PACKED @120 GB/rank) — Traditional AGGREGATED serving,
+# KVBM STANDALONE (no hub). Same as agg-baseline-tep2x6-trace-replay-sa.yaml EXCEPT: the
+# KVBM G2 host cache is dropped 160 -> 120 GB/RANK so 2 TEP=2 workers can BIN-PACK 2/node
+# STABLY (Strategy A: ~3 nodes instead of the 6-node spread), and concurrency is 80.
+#
+# WHY 120 (OOM root-cause): cache_size_gb is PER-RANK. Bin-packed = 2 workers/node x 2 ranks/
+# worker = 4 ranks/node. At 160/rank the G2 pinned footprint is 4 x (160 x 0.931 GiB) =
+# ~596 GiB/node, leaving only ~294 GiB headroom under the 890.4 GiB cgroup host-mem cap
+# (890.4 - 596 = 294.4) — insufficient once weights + engine/process overhead are added,
+# so it OOM-killed at c80/c96 (hence the 6-node spread fallback in agg-baseline-tep2x6-c80).
+# At 120/rank: 4 x (120 x 0.931 = ~112 GiB) = ~447 GiB pinned/node, leaving ~443 GiB headroom
+# under 890.4 GiB — comfortably stable bin-packed. GPU is NOT the constraint
+# (gpu-memory-utilization stays 0.85).
+#
+# WHY TEP=2: each worker spans only 2 GPUs (vs 4 at TEP=4), so each worker holds MORE
+# NVFP4 weight per GPU (~59 GB/GPU vs ~30) and has a SMALLER per-worker G1 (GPU KV).
+# A smaller G1 fills sooner under the long-context trace => more reuse spills to G2,
+# i.e. exercises the G1<->G2 tiering harder than TEP=4 (which ran G1 only ~30% full,
+# G2 external-hit 6.3%). Packs into 3 nodes. Compare against TEP=4x4 (job 2185318).
+#
+# NOTE: 2 standalone-kvbm workers per node is the same pattern the 32B smoke validated
+# (job 2184819), but TEP=2 on the 235B is a fresh bringup — watch that G1 KV still fits
+# max-model-len 262144 (each TEP=2 worker has ~half the KV capacity of a TEP=4 worker).
+#
+# See docs/runs/cd_comparison_experiments.md for the per-rank G2 finding + cgroup math.
+
+name: "kvbm-agg-binpack120-c92"
+
+identity:
+  model:
+    repo: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+    revision: "1c4ec35802abf3a20672be7e5c51a098796f71d6"
+  container:
+    image: "nvcr.io/nvidian/dynamo-dev/ryan:kvbm-vllm-dev-260602"
+  frameworks:
+    dynamo: "1.2.0"
+    vllm: "0.21.0"
+
+slurm:
+  account: "core_dlfw_ci"
+  partition: "tcpo"
+  time_limit: "01:45:00"
+
+setup_script: kvbm-dev-install.sh
+dynamo:
+  install: false
+
+model:
+  path: "hf:nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+  container: "/lustre/fsw/core_dlfw_ci/ryan/enroot_images/kvbm-prod-260607.sqsh"  # align to 260607 (was 260603b from the agg base) for the bin-pack SOP reset
+  precision: "fp4"
+
+extra_mount:
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments/dynamo:/workspace"
+  - "/lustre/fsw/core_dlfw_ci/ryan/kvbm-experiments:/models"
+  - "/lustre/fsw/core_dlfw_ci/ryan/hf_cache:/hf_cache"
+
+environment:
+  HF_HOME: "/hf_cache"
+  HF_HUB_OFFLINE: "1"
+  KVBM_SKIP_VLLM_VERSION_CHECK: "1"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+  ENABLE_EXPERT_PARALLEL: "1"           # TEP: 235B-A22B (128 experts) — EP across the 2 TP ranks
+  NIXL_PLUGIN_DIR: "/usr/local/lib/python3.12/dist-packages/.nixl_cu13.mesonpy.libs/plugins"
+  # No KVBM_CONTROL_METRICS: no hub. G2 activity reads from vllm:external_prefix_cache_hits.
+  DYN_LOG: "error"
+  RUST_LOG: "error"
+
+resources:
+  gpu_type: "gb200"
+  gpus_per_node: 4
+  # Decode plane: 6 AGGREGATED TEP=2 workers (2 GPUs each), BIN-PACKED 2 per GB200 node => 3 nodes.
+  # No spread_workers => the topology packs 2 workers (4 GPUs) onto each node.
+  agg_nodes: 3
+  agg_workers: 6
+  gpus_per_agg: 2
+
+infra:
+  # Co-locate etcd/nats + the dynamo frontend on a serving node => exactly 3 GB200 nodes
+  # (= 6 TEP=2 workers, 2/node).
+  etcd_nats_dedicated_node: false
+
+frontend:
+  type: dynamo
+  enable_multiple_frontends: false
+  args:
+    # KV-AWARE routing (iso with the CD plane) — the in-process consolidator relays each
+    # agg worker's G1+G2 KV events to this KV-router, so the agg baseline routes by
+    # prefix-cache affinity exactly like CD. (Was round-robin; that conflated routing with
+    # disaggregation in the agg-vs-CD delta — see docs/runs/cd_comparison_experiments.md.)
+    router-mode: "kv"
+    router-kv-events: true
+    router-min-initial-workers: 6       # = agg_workers (wait for all 6 before serving)
+
+backend:
+  type: vllm
+
+  # STANDALONE kvbm v2 connector (no hub) + the in-process CONSOLIDATOR for KV-aware routing:
+  # kvbm_consolidator=true applies the CD decode plane's routing methodology (consolidator
+  # relays G1+G2 events to the KV-router; prefix-caching forced ON; per-worker KV events)
+  # WITHOUT the hub/prefill sidecar. So agg routes iso with CD and the agg-vs-CD delta
+  # isolates conditional disaggregation. cache.host cache_size_gb is PER-RANK (2 ranks/worker
+  # * 120 = 240/worker; 2 workers/node = 4 ranks/node => ~447 GiB/node pinned — fits stably
+  # bin-packed under the 890.4 GiB cgroup cap, no hub on the agg head node).
+  kvbm_consolidator: true
+  connector: '{"kv_connector": "DynamoConnector", "kv_role": "kv_both", "kv_connector_module_path": "kvbm.v2.vllm.connector", "kv_connector_extra_config": {"default": {"block_layout": "operational"}, "leader": {"cache": {"host": {"cache_size_gb": 120.0}}, "max_seq_len": 262144}, "worker": {"nixl": {"backends": {"UCX": {}, "POSIX": {}}}}}}'
+
+  aggregated_environment:
+    DYN_HEALTH_CHECK_ENABLED: "false"
+    PYTHONUNBUFFERED: "1"
+
+  vllm_config:
+    aggregated:
+      served-model-name: "nvidia/Qwen3-235B-A22B-Instruct-2507-NVFP4"
+      tensor-parallel-size: 2            # TEP=2 (vs 4 in the sibling recipe)
+      enable-expert-parallel: true
+      gpu-memory-utilization: 0.85
+      block-size: 64
+      max-model-len: 262144
+      enable-prefix-caching: true
+
+benchmark:
+  type: "trace-replay-sa"
+  public_dataset: "semianalysis_cc_traces_weka_with_subagents_256k"
+  num_dataset_entries: 470           # full with-subagents 256k corpus (470 traces)
+  concurrencies: "92"
+  ttft_threshold_ms: 5000
+  itl_threshold_ms: 10
+  aiperf_package: "git+https://github.com/cquil11/aiperf.git@062a5de92c8ac8a0a6dd5d2a7fb9a539a147f3d9"
+  aiperf_args:
+    benchmark-duration: 1200
+    benchmark-grace-period: 30
+    request-timeout-seconds: 1200
+    workers-max: 200
+    record-processors: 8
+    profile-export-level: raw
+    concurrency-ramp-duration: 120
+    export-http-trace: true

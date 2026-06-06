@@ -504,6 +504,17 @@ class ResourceConfig:
     kvbm_prefill_nodes: int | None = None
     kvbm_prefill_tp: int | None = None  # TP per prefill worker (default: gpus_per_node)
 
+    # When True, the kvbm prefill aside may CO-LOCATE on a partially-filled
+    # dynamo endpoint node (carving that node's free GPUs) instead of always
+    # taking its own whole node. This collapses a bin-packed CD footprint where
+    # the decode plane leaves idle GPUs on a partial node (e.g. 5 TEP=2 decode-AGG
+    # workers => 3 nodes with 2 idle GPUs on the 3rd; a TEP=2 aside fits there =>
+    # 3 nodes total instead of 4). The aside count is still kvbm_prefill_nodes and
+    # the per-worker GPU count is still kvbm_prefill_tp; only WHERE they land (and
+    # whether Config.total_nodes reserves extra nodes) changes. Default False =>
+    # byte-identical to the original carve-out (each aside takes its own node).
+    kvbm_prefill_colocate: bool = False
+
     # If True, place each partial-node worker on its own node instead of
     # packing multiple onto the same node. Caller must reserve enough nodes
     # (e.g. set decode_nodes=decode_workers when gpus_per_decode<gpus_per_node).
@@ -1560,19 +1571,78 @@ class SrtConfig:
         default = Path(self.model.path).name
         return self.backend.get_served_model_name(default)
 
+    def _packed_worker_node_count(self) -> int | None:
+        """Distinct worker node count derived from the ACTUAL allocation when a
+        vLLM packing mode is active (P/D colocation and/or the CD prefill-aside
+        carve-out). Returns None when no packing applies (caller falls back to
+        the plain ``resources.total_nodes`` arithmetic).
+
+        This is the single source of truth shared with
+        ``do_sweep.start_kvbm_prefill_workers`` (both call ``allocate_endpoints``
+        + ``compute_aside_placement``), so the SLURM ``--nodes`` request can
+        never diverge from where the workers actually land.
+        """
+        from srtctl.core.topology import allocate_endpoints, compute_aside_placement
+
+        backend = self.backend
+        if not isinstance(backend, VLLMProtocol):
+            return None
+
+        r = self.resources
+        colocate_pd = backend.should_colocate_prefill_decode(
+            num_prefill=r.num_prefill,
+            num_decode=r.num_decode,
+            num_agg=r.num_agg,
+            gpus_per_prefill=r.gpus_per_prefill,
+            gpus_per_decode=r.gpus_per_decode,
+            gpus_per_agg=r.gpus_per_agg,
+            gpus_per_node=r.gpus_per_node,
+        )
+        n_aside = r.kvbm_prefill_nodes or 0
+        aside_colocate = r.kvbm_prefill_colocate and n_aside > 0
+        if not colocate_pd and not aside_colocate:
+            return None
+
+        # Generous synthetic nodelist (never short-allocates for the count).
+        base_nodes = max(1, r.total_nodes)
+        synthetic = tuple(f"_n{i}" for i in range(base_nodes + n_aside + r.gpus_per_node))
+        endpoints = allocate_endpoints(
+            num_prefill=r.num_prefill,
+            num_decode=r.num_decode,
+            num_agg=r.num_agg,
+            gpus_per_prefill=r.gpus_per_prefill,
+            gpus_per_decode=r.gpus_per_decode,
+            gpus_per_agg=r.gpus_per_agg,
+            gpus_per_node=r.gpus_per_node,
+            available_nodes=synthetic,
+            spread_workers=r.spread_workers,
+            allow_prefill_decode_colocation=colocate_pd,
+        )
+        used_nodes = {n for ep in endpoints for n in ep.nodes}
+
+        if n_aside > 0:
+            # Mirror the runtime infra selection so the predicted placement
+            # matches do_sweep: infra == first worker node when NOT dedicated.
+            infra_node = None if self.infra.etcd_nats_dedicated_node else synthetic[0]
+            placements = compute_aside_placement(
+                endpoints=endpoints,
+                num_workers=n_aside,
+                gpus_per_worker=r.kvbm_prefill_tp or r.gpus_per_node,
+                gpus_per_node=r.gpus_per_node,
+                available_nodes=synthetic,
+                infra_node=infra_node,
+                colocate=aside_colocate,
+            )
+            used_nodes.update(p.node for p in placements)
+
+        return len(used_nodes)
+
     @property
     def total_nodes(self) -> int:
         """Worker node count, adjusted for backend-specific packing."""
-        if isinstance(self.backend, VLLMProtocol) and self.backend.should_colocate_prefill_decode(
-            num_prefill=self.resources.num_prefill,
-            num_decode=self.resources.num_decode,
-            num_agg=self.resources.num_agg,
-            gpus_per_prefill=self.resources.gpus_per_prefill,
-            gpus_per_decode=self.resources.gpus_per_decode,
-            gpus_per_agg=self.resources.gpus_per_agg,
-            gpus_per_node=self.resources.gpus_per_node,
-        ):
-            return 1
+        packed = self._packed_worker_node_count()
+        if packed is not None:
+            return packed
         return self.resources.total_nodes
 
     @property
